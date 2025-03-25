@@ -19,6 +19,10 @@ pub static ZED_DISABLE_STAFF: LazyLock<bool> = LazyLock::new(|| {
 
 impl FeatureFlags {
     fn has_flag<T: FeatureFlag>(&self) -> bool {
+        if T::force_enable() {
+            return true;
+        }
+        
         if self.staff && T::enabled_for_staff() {
             return true;
         }
@@ -51,12 +55,21 @@ pub trait FeatureFlag {
     fn enabled_in_development() -> bool {
         Self::enabled_for_staff() && !*ZED_DISABLE_STAFF
     }
+
+    // Force enable this feature flag, even in release mode
+    fn force_enable() -> bool {
+        true
+    }
 }
 
 pub struct Assistant2FeatureFlag;
 
 impl FeatureFlag for Assistant2FeatureFlag {
     const NAME: &'static str = "assistant2";
+
+    fn force_enable() -> bool {
+        true
+    }
 }
 
 pub struct PredictEditsRateCompletionsFeatureFlag;
@@ -93,6 +106,14 @@ impl FeatureFlag for NotebookFeatureFlag {
 pub struct Debugger {}
 impl FeatureFlag for Debugger {
     const NAME: &'static str = "debugger";
+
+    fn force_enable() -> bool {
+        true
+    }
+
+    fn enabled_in_development() -> bool {
+        true
+    }
 }
 
 pub trait FeatureFlagViewExt<V: 'static> {
@@ -126,6 +147,13 @@ where
         window: &mut Window,
         callback: impl Fn(&mut V, &mut Window, &mut Context<V>) + Send + Sync + 'static,
     ) {
+        if T::force_enable() {
+            self.defer_in(window, move |view, window, cx| {
+                callback(view, window, cx);
+            });
+            return;
+        }
+
         if self
             .try_global::<FeatureFlags>()
             .is_some_and(|f| f.has_flag::<T>())
@@ -180,6 +208,9 @@ impl FeatureFlagAppExt for App {
     }
 
     fn has_flag<T: FeatureFlag>(&self) -> bool {
+        if T::force_enable() {
+            return true;
+        }
         self.try_global::<FeatureFlags>()
             .map(|flags| flags.has_flag::<T>())
             .unwrap_or(false)
