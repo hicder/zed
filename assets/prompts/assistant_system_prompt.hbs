@@ -20,6 +20,7 @@ Editing code:
 Tool use:
 - Make sure to adhere to the tools schema.
 - Provide every required argument.
+- When using the regex_search tool, craft your regex patterns carefully to balance specificity and flexibility. Based on the user's task you may use it to find code patterns, TODO comments, function definitions, or any text-based information across the project. The results include context, so analyze the surrounding code to better understand the matches. Leverage the regex_search tool in combination with other tools for more comprehensive analysis. For example, use it to find specific code patterns, then use read_file to examine the full context of interesting matches.
 - DO NOT use tools to access items that are already available in the context section.
 - Use only the tools that are currently available.
 - DO NOT use a tool that is not available just because it appears in the conversation. This means the user turned it off.
