@@ -348,6 +348,7 @@ impl MarkdownStyle {
         let body_font_size = rems(1.0);
         self.base_text_style.font_size = body_font_size.into();
         self.container_style.text.font_size = Some(body_font_size.into());
+        self.code_block.text.font_size = Some(rems(0.85).into());
 
         self.base_text_style.color = colors.text;
         self.base_text_style.line_height = relative(1.5);
@@ -6623,6 +6624,11 @@ mod tests {
                 ),
                 "preview container font size must be rem-based, got {:?}",
                 style.container_style.text.font_size
+            );
+            assert_eq!(
+                style.code_block.text.font_size,
+                Some(rems(0.85).into()),
+                "preview code block font size should be smaller than body text"
             );
         });
     }

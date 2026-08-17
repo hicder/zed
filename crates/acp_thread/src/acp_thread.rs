@@ -2581,6 +2581,9 @@ impl AcpThread {
                     });
                 if !already_in_user_message {
                     self.push_user_content_block_from_agent(message_id, content, cx);
+                    // Older Zed sessions flattened file resources into text before handing them
+                    // to the agent, so ACP history replay cannot preserve their resource type.
+                    self.restore_legacy_file_context_in_last_user_message(cx);
                 }
             }
             acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk {
@@ -2687,6 +2690,29 @@ impl AcpThread {
         cx: &mut Context<Self>,
     ) {
         self.push_user_content_block_with_protocol_id(None, false, id, chunk, false, cx)
+    }
+
+    fn restore_legacy_file_context_in_last_user_message(&mut self, cx: &mut Context<Self>) {
+        let Some(AgentThreadEntry::UserMessage(message)) = self.entries.last() else {
+            return;
+        };
+
+        let path_style = self.project.read(cx).path_style(cx);
+        let Some(chunks) = restore_legacy_file_context(&message.chunks, path_style) else {
+            return;
+        };
+
+        let language_registry = self.project.read(cx).languages().clone();
+        let content = ContentBlock::new_combined(chunks.clone(), language_registry, path_style, cx);
+        let Some(entry_index) = self.entries.len().checked_sub(1) else {
+            return;
+        };
+        let Some(AgentThreadEntry::UserMessage(message)) = self.entries.last_mut() else {
+            return;
+        };
+        message.chunks = chunks;
+        message.content = content;
+        cx.emit(AcpThreadEvent::EntryUpdated(entry_index));
     }
 
     fn push_user_content_block_with_protocol_id(
@@ -4718,6 +4744,114 @@ impl AcpThread {
     }
 }
 
+fn restore_legacy_file_context(
+    chunks: &[acp::ContentBlock],
+    path_style: PathStyle,
+) -> Option<Vec<acp::ContentBlock>> {
+    let mut restored = Vec::new();
+    let mut text = String::new();
+    let mut restored_context = false;
+
+    for chunk in chunks {
+        if let acp::ContentBlock::Text(text_content) = chunk {
+            text.push_str(&text_content.text);
+        } else {
+            append_restored_legacy_file_context(
+                std::mem::take(&mut text),
+                path_style,
+                &mut restored,
+                &mut restored_context,
+            );
+            restored.push(chunk.clone());
+        }
+    }
+    append_restored_legacy_file_context(text, path_style, &mut restored, &mut restored_context);
+
+    restored_context.then_some(restored)
+}
+
+fn append_restored_legacy_file_context(
+    text: String,
+    path_style: PathStyle,
+    restored: &mut Vec<acp::ContentBlock>,
+    restored_context: &mut bool,
+) {
+    if text.is_empty() {
+        return;
+    }
+
+    const OPEN_CONTEXT: &str = "<context ref=\"";
+    const CLOSE_CONTEXT: &str = "</context>";
+
+    let mut remaining = text.as_str();
+    let mut pending_text = String::new();
+
+    while let Some(context_start) = remaining.find(OPEN_CONTEXT) {
+        pending_text.push_str(&remaining[..context_start]);
+        let after_open = &remaining[context_start + OPEN_CONTEXT.len()..];
+        let Some(reference_end) = after_open.find("\">") else {
+            pending_text.push_str(&remaining[context_start..]);
+            remaining = "";
+            break;
+        };
+        let reference = &after_open[..reference_end];
+        let Ok(mention) = MentionUri::parse(reference, path_style) else {
+            pending_text
+                .push_str(&remaining[..context_start + OPEN_CONTEXT.len() + reference_end + 2]);
+            remaining = &after_open[reference_end + 2..];
+            continue;
+        };
+        if !matches!(mention, MentionUri::File { .. }) {
+            pending_text
+                .push_str(&remaining[..context_start + OPEN_CONTEXT.len() + reference_end + 2]);
+            remaining = &after_open[reference_end + 2..];
+            continue;
+        }
+
+        let context_body = &after_open[reference_end + 2..];
+        let Some(context_end) = context_body.find(CLOSE_CONTEXT) else {
+            pending_text.push_str(&remaining[context_start..]);
+            remaining = "";
+            break;
+        };
+
+        let mention_link = mention.as_link().to_string();
+        let Some(link_start) = pending_text.rfind(&mention_link).filter(|link_start| {
+            pending_text[*link_start + mention_link.len()..]
+                .chars()
+                .all(char::is_whitespace)
+        }) else {
+            pending_text
+                .push_str(&remaining[..context_start + OPEN_CONTEXT.len() + reference_end + 2]);
+            remaining = &after_open[reference_end + 2..];
+            continue;
+        };
+        pending_text.replace_range(link_start..link_start + mention_link.len(), "");
+        if !pending_text.is_empty() {
+            restored.push(acp::ContentBlock::Text(acp::TextContent::new(
+                std::mem::take(&mut pending_text),
+            )));
+        }
+
+        let contents = context_body[..context_end]
+            .strip_prefix('\n')
+            .unwrap_or(&context_body[..context_end]);
+        let contents = contents.strip_suffix('\n').unwrap_or(contents);
+        restored.push(acp::ContentBlock::Resource(acp::EmbeddedResource::new(
+            acp::EmbeddedResourceResource::TextResourceContents(acp::TextResourceContents::new(
+                contents, reference,
+            )),
+        )));
+        *restored_context = true;
+        remaining = &context_body[context_end + CLOSE_CONTEXT.len()..];
+    }
+
+    pending_text.push_str(remaining);
+    if !pending_text.is_empty() {
+        restored.push(acp::ContentBlock::Text(acp::TextContent::new(pending_text)));
+    }
+}
+
 fn markdown_for_raw_output(
     raw_output: &serde_json::Value,
     language_registry: &Arc<LanguageRegistry>,
@@ -5617,6 +5751,70 @@ mod tests {
                     .as_deref(),
                 Some("msg_user_3")
             );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_restores_legacy_file_context_as_resources(cx: &mut gpui::TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let connection = Rc::new(FakeAgentConnection::new());
+        let thread = cx
+            .update(|cx| {
+                connection.new_session(project, PathList::new(&[Path::new(path!("/test"))]), cx)
+            })
+            .await
+            .expect("creating the test session should succeed");
+
+        thread.update(cx, |thread, cx| {
+            for text in [
+                "Restore [@one.go](file:///tmp/one.go)",
+                "\n<context ref=\"file:///tmp/one.go\">\npackage one\n</context>",
+                "\n[@two.go](file:///tmp/two.go)",
+                "\n<context ref=\"file:///tmp/two.go\">\npackage two\n</context>",
+            ] {
+                let result = thread.handle_session_update(
+                    acp::SessionUpdate::UserMessageChunk(
+                        acp::ContentChunk::new(text.into()).message_id("restored-user-message"),
+                    ),
+                    cx,
+                );
+                assert!(result.is_ok(), "restoring a user message should succeed");
+            }
+        });
+
+        thread.update(cx, |thread, cx| {
+            let [AgentThreadEntry::UserMessage(message)] = thread.entries.as_slice() else {
+                panic!("expected one restored user message")
+            };
+            let markdown = message.content.to_markdown(cx);
+            assert!(markdown.contains("Restore"));
+            assert!(markdown.contains("[@one.go](file:///tmp/one.go)"));
+            assert!(markdown.contains("[@two.go](file:///tmp/two.go)"));
+            assert!(!markdown.contains("<context"));
+            assert!(!markdown.contains("package one"));
+            assert!(!markdown.contains("package two"));
+
+            let resources = message
+                .chunks
+                .iter()
+                .filter_map(|chunk| match chunk {
+                    acp::ContentBlock::Resource(acp::EmbeddedResource {
+                        resource: acp::EmbeddedResourceResource::TextResourceContents(resource),
+                        ..
+                    }) => Some(resource),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            let [first, second] = resources.as_slice() else {
+                panic!("expected two restored file resources")
+            };
+            assert_eq!(first.uri, "file:///tmp/one.go");
+            assert_eq!(first.text, "package one");
+            assert_eq!(second.uri, "file:///tmp/two.go");
+            assert_eq!(second.text, "package two");
         });
     }
 
