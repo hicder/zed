@@ -22,8 +22,15 @@ pub(super) fn render_mermaid(source: &str, theme: &MermaidTheme) -> Result<Strin
     let pipeline = merman::svg::SvgPipeline::resvg_safe()
         .with_postprocessor(merman::svg::CssOverridePostprocessor::strip_existing_important());
 
+    // If this is TD, replace with LR chart
+    let source = if source.contains("TD\n") {
+        source.replace("TD\n", "LR\n")
+    } else {
+        source.to_string()
+    };
+
     let svg = renderer
-        .render_svg_with_pipeline_sync(source, &pipeline)
+        .render_svg_with_pipeline_sync(&source, &pipeline)
         .context("merman render failed")?
         .ok_or_else(|| anyhow!("merman returned no SVG for the given input"))?;
 
