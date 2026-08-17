@@ -687,6 +687,148 @@ enum ToolCallLayout {
     Floating,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TurnEntryRole {
+    User,
+    Assistant {
+        has_message: bool,
+        has_thought: bool,
+    },
+    Work,
+    BlocksCollapse,
+}
+
+impl TurnEntryRole {
+    fn from_entry(entry: &AgentThreadEntry, thread: &AcpThread) -> Self {
+        match entry {
+            AgentThreadEntry::UserMessage(_) => Self::User,
+            AgentThreadEntry::AssistantMessage(message) => Self::Assistant {
+                has_message: message
+                    .chunks
+                    .iter()
+                    .any(|chunk| matches!(chunk, AssistantMessageChunk::Message { .. })),
+                has_thought: message
+                    .chunks
+                    .iter()
+                    .any(|chunk| matches!(chunk, AssistantMessageChunk::Thought { .. })),
+            },
+            AgentThreadEntry::ToolCall(tool_call) => Self::from_tool_call_status(&tool_call.status),
+            AgentThreadEntry::Elicitation(elicitation_id) => Self::from_elicitation_is_interactive(
+                thread
+                    .elicitation(elicitation_id)
+                    .is_some_and(|(_, elicitation)| should_render_elicitation(elicitation)),
+            ),
+            AgentThreadEntry::CompletedPlan(_) | AgentThreadEntry::ContextCompaction(_) => {
+                Self::Work
+            }
+        }
+    }
+
+    fn from_tool_call_status(status: &ToolCallStatus) -> Self {
+        match status {
+            ToolCallStatus::Pending
+            | ToolCallStatus::WaitingForConfirmation { .. }
+            | ToolCallStatus::InProgress => Self::BlocksCollapse,
+            ToolCallStatus::Completed
+            | ToolCallStatus::Failed
+            | ToolCallStatus::Rejected
+            | ToolCallStatus::Canceled => Self::Work,
+        }
+    }
+
+    fn from_elicitation_is_interactive(is_interactive: bool) -> Self {
+        if is_interactive {
+            Self::BlocksCollapse
+        } else {
+            Self::Work
+        }
+    }
+
+    fn is_work(self) -> bool {
+        match self {
+            Self::Assistant {
+                has_message,
+                has_thought,
+            } => has_message || has_thought,
+            Self::Work => true,
+            Self::User | Self::BlocksCollapse => false,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct WorkedTurn {
+    user_message_ix: usize,
+    summary_entry_ix: usize,
+    final_response_ix: usize,
+}
+
+fn worked_turn_for_roles(
+    entry_count: usize,
+    entry_ix: usize,
+    is_generating: bool,
+    role_at: impl Fn(usize) -> TurnEntryRole,
+) -> Option<WorkedTurn> {
+    if entry_ix >= entry_count || matches!(role_at(entry_ix), TurnEntryRole::User) {
+        return None;
+    }
+
+    let user_message_ix = (0..entry_ix)
+        .rev()
+        .find(|&ix| matches!(role_at(ix), TurnEntryRole::User))?;
+    let next_user_message_ix =
+        (user_message_ix + 1..entry_count).find(|&ix| matches!(role_at(ix), TurnEntryRole::User));
+    let turn_end = next_user_message_ix.unwrap_or(entry_count);
+
+    if next_user_message_ix.is_none() && is_generating {
+        return None;
+    }
+
+    if (user_message_ix + 1..turn_end)
+        .any(|ix| matches!(role_at(ix), TurnEntryRole::BlocksCollapse))
+    {
+        return None;
+    }
+
+    let final_response_ix = (user_message_ix + 1..turn_end).rev().find(|&ix| {
+        matches!(
+            role_at(ix),
+            TurnEntryRole::Assistant {
+                has_message: true,
+                ..
+            }
+        )
+    })?;
+
+    if (final_response_ix + 1..turn_end).any(|ix| role_at(ix).is_work()) {
+        return None;
+    }
+
+    let summary_entry_ix = (user_message_ix + 1..=final_response_ix).find(|&ix| {
+        if ix == final_response_ix {
+            matches!(
+                role_at(ix),
+                TurnEntryRole::Assistant {
+                    has_thought: true,
+                    ..
+                }
+            )
+        } else {
+            role_at(ix).is_work()
+        }
+    })?;
+
+    if entry_ix >= turn_end {
+        return None;
+    }
+
+    Some(WorkedTurn {
+        user_message_ix,
+        summary_entry_ix,
+        final_response_ix,
+    })
+}
+
 impl ToolCallLayout {
     /// Stable discriminant used to disambiguate element ids when the same tool
     /// call is rendered in more than one layout at once (e.g. inline in the
@@ -6116,6 +6258,37 @@ impl ThreadView {
         .flex_grow_1()
     }
 
+    fn render_worked_turn_summary(
+        &self,
+        user_message_ix: usize,
+        is_expanded: bool,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        h_flex()
+            .id(("worked-turn", user_message_ix))
+            .px_5()
+            .py_1p5()
+            .gap_1()
+            .cursor_pointer()
+            .child(
+                Disclosure::new(("worked-turn-disclosure", user_message_ix), is_expanded)
+                    .opened_icon(IconName::ChevronDown)
+                    .closed_icon(IconName::ChevronRight),
+            )
+            .child(
+                Label::new("Tool Calls")
+                    .size(LabelSize::Small)
+                    .color(Color::Muted),
+            )
+            .on_click(cx.listener(move |this, _event: &ClickEvent, _window, cx| {
+                this.entry_view_state.update(cx, |state, _cx| {
+                    state.toggle_worked_turn_expansion(user_message_ix);
+                });
+                cx.notify();
+            }))
+            .into_any_element()
+    }
+
     fn render_entry(
         &self,
         entry_ix: usize,
@@ -6132,6 +6305,27 @@ impl ThreadView {
                 .entries()
                 .get(entry_ix.saturating_sub(1))
                 .is_none_or(|entry| !entry.is_indented());
+
+        let worked_turn = {
+            let thread = self.thread.read(cx);
+            let entries = thread.entries();
+            worked_turn_for_roles(
+                entries.len(),
+                entry_ix,
+                matches!(thread.status(), ThreadStatus::Generating),
+                |ix| TurnEntryRole::from_entry(&entries[ix], thread),
+            )
+        };
+        let worked_turn_is_expanded = worked_turn.is_some_and(|turn| {
+            self.entry_view_state
+                .read(cx)
+                .is_worked_turn_expanded(turn.user_message_ix)
+        });
+        let hide_work_content = worked_turn
+            .is_some_and(|turn| !worked_turn_is_expanded && entry_ix != turn.final_response_ix);
+        let hide_final_response_thoughts = worked_turn
+            .is_some_and(|turn| !worked_turn_is_expanded && entry_ix == turn.final_response_ix);
+        let show_worked_summary = worked_turn.is_some_and(|turn| entry_ix == turn.summary_entry_ix);
 
         let mut assistant_message_is_blank = false;
 
@@ -6347,6 +6541,9 @@ impl ThreadView {
                                 })
                             }
                             AssistantMessageChunk::Thought { block, .. } => {
+                                if hide_final_response_thoughts {
+                                    return None;
+                                }
                                 block.markdown().and_then(|md| {
                                     let this_is_blank = md.read(cx).source().trim().is_empty();
                                     is_blank = is_blank && this_is_blank;
@@ -6454,6 +6651,26 @@ impl ThreadView {
             AgentThreadEntry::ContextCompaction(compaction) => {
                 self.render_context_compaction(entry_ix, compaction, window, cx)
             }
+        };
+
+        let primary = if hide_work_content {
+            Empty.into_any_element()
+        } else {
+            primary
+        };
+
+        let primary = if let Some(turn) = worked_turn.filter(|_| show_worked_summary) {
+            v_flex()
+                .w_full()
+                .child(self.render_worked_turn_summary(
+                    turn.user_message_ix,
+                    worked_turn_is_expanded,
+                    cx,
+                ))
+                .child(primary)
+                .into_any_element()
+        } else {
+            primary
         };
 
         let is_subagent_output = self.is_subagent()
@@ -12690,6 +12907,128 @@ mod tests {
         acp::AvailableCommand::new(name, "").meta(acp_thread::meta_with_command_category(
             acp_thread::CommandCategory::Mcp,
         ))
+    }
+
+    fn worked_turn(
+        roles: &[TurnEntryRole],
+        entry_ix: usize,
+        is_generating: bool,
+    ) -> Option<WorkedTurn> {
+        worked_turn_for_roles(roles.len(), entry_ix, is_generating, |ix| roles[ix])
+    }
+
+    #[test]
+    fn test_completed_turn_work_is_derived_from_entries() {
+        let roles = [
+            TurnEntryRole::User,
+            TurnEntryRole::Assistant {
+                has_message: true,
+                has_thought: false,
+            },
+            TurnEntryRole::Work,
+            TurnEntryRole::Assistant {
+                has_message: true,
+                has_thought: true,
+            },
+        ];
+
+        let expected = Some(WorkedTurn {
+            user_message_ix: 0,
+            summary_entry_ix: 1,
+            final_response_ix: 3,
+        });
+        assert_eq!(worked_turn(&roles, 1, false), expected);
+        assert_eq!(worked_turn(&roles, 2, false), expected);
+        assert_eq!(worked_turn(&roles, 3, false), expected);
+        assert_eq!(worked_turn(&roles, 0, false), None);
+    }
+
+    #[test]
+    fn test_current_turn_work_stays_expanded() {
+        let roles = [
+            TurnEntryRole::User,
+            TurnEntryRole::Work,
+            TurnEntryRole::Assistant {
+                has_message: true,
+                has_thought: false,
+            },
+        ];
+
+        assert_eq!(worked_turn(&roles, 1, true), None);
+        assert!(worked_turn(&roles, 1, false).is_some());
+    }
+
+    #[test]
+    fn test_completed_previous_turn_collapses_while_next_turn_generates() {
+        let roles = [
+            TurnEntryRole::User,
+            TurnEntryRole::Work,
+            TurnEntryRole::Assistant {
+                has_message: true,
+                has_thought: false,
+            },
+            TurnEntryRole::User,
+            TurnEntryRole::Work,
+        ];
+
+        assert!(worked_turn(&roles, 1, true).is_some());
+        assert_eq!(worked_turn(&roles, 4, true), None);
+    }
+
+    #[test]
+    fn test_plain_answers_and_unresolved_work_do_not_collapse() {
+        let plain_answer = [
+            TurnEntryRole::User,
+            TurnEntryRole::Assistant {
+                has_message: true,
+                has_thought: false,
+            },
+        ];
+        assert_eq!(worked_turn(&plain_answer, 1, false), None);
+
+        let unresolved = [
+            TurnEntryRole::User,
+            TurnEntryRole::BlocksCollapse,
+            TurnEntryRole::Assistant {
+                has_message: true,
+                has_thought: false,
+            },
+        ];
+        assert_eq!(worked_turn(&unresolved, 1, false), None);
+    }
+
+    #[test]
+    fn test_terminal_tool_call_outcomes_are_work() {
+        for status in [
+            ToolCallStatus::Completed,
+            ToolCallStatus::Failed,
+            ToolCallStatus::Rejected,
+            ToolCallStatus::Canceled,
+        ] {
+            assert_eq!(
+                TurnEntryRole::from_tool_call_status(&status),
+                TurnEntryRole::Work
+            );
+        }
+
+        for status in [ToolCallStatus::Pending, ToolCallStatus::InProgress] {
+            assert_eq!(
+                TurnEntryRole::from_tool_call_status(&status),
+                TurnEntryRole::BlocksCollapse
+            );
+        }
+    }
+
+    #[test]
+    fn test_only_interactive_elicitations_block_collapse() {
+        assert_eq!(
+            TurnEntryRole::from_elicitation_is_interactive(true),
+            TurnEntryRole::BlocksCollapse
+        );
+        assert_eq!(
+            TurnEntryRole::from_elicitation_is_interactive(false),
+            TurnEntryRole::Work
+        );
     }
 
     #[test]
