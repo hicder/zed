@@ -86,7 +86,7 @@ else
 fi
 
 # Generate the licenses first, so they can be baked into the binaries
-script/generate-licenses
+# script/generate-licenses
 
 rustup target add $target_triple
 
@@ -246,7 +246,7 @@ function sign_app_binaries() {
             echo "Created application bundle:"
             echo "$app_path"
         fi
-    else
+    elif [ "$local_install" = false ]; then
         dmg_target_directory="target/${target_triple}/${target_dir}"
         dmg_source_directory="${dmg_target_directory}/dmg"
         dmg_file_path="${dmg_target_directory}/Zed-${arch_suffix}.dmg"
