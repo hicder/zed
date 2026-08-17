@@ -68,6 +68,10 @@ pub(super) fn render_mermaid(
         ..merman::SvgRequest::default()
     };
 
+    let adjusted_direction = source
+        .contains("TD\n")
+        .then(|| source.replace("TD\n", "LR\n"));
+    let source = adjusted_direction.as_deref().unwrap_or(source);
     let output = merman::Renderer::new()
         .with_engine(merman::Engine::new().with_site_config(to_merman_config(theme)?))
         .render(merman::RenderRequest::svg(source, control, request));
