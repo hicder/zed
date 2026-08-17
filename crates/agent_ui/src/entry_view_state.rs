@@ -48,6 +48,8 @@ pub struct EntryViewState {
     user_toggled_thinking_blocks: HashSet<(usize, usize)>,
     expanded_compactions: HashSet<usize>,
     expanded_tool_calls: HashSet<acp::ToolCallId>,
+    expanded_worked_turns: HashSet<usize>,
+    cancelled_worked_turns: HashSet<usize>,
 }
 
 impl EntryViewState {
@@ -70,7 +72,31 @@ impl EntryViewState {
             user_toggled_thinking_blocks: HashSet::default(),
             expanded_compactions: HashSet::default(),
             expanded_tool_calls: HashSet::default(),
+            expanded_worked_turns: HashSet::default(),
+            cancelled_worked_turns: HashSet::default(),
         }
+    }
+
+    pub(crate) fn is_worked_turn_expanded(&self, user_message_ix: usize) -> bool {
+        self.expanded_worked_turns.contains(&user_message_ix)
+    }
+
+    pub(crate) fn toggle_worked_turn_expansion(&mut self, user_message_ix: usize) {
+        if !self.expanded_worked_turns.remove(&user_message_ix) {
+            self.expanded_worked_turns.insert(user_message_ix);
+        }
+    }
+
+    pub(crate) fn mark_worked_turn_cancelled(&mut self, user_message_ix: usize) {
+        self.cancelled_worked_turns.insert(user_message_ix);
+    }
+
+    pub(crate) fn clear_worked_turn_cancelled(&mut self, user_message_ix: usize) {
+        self.cancelled_worked_turns.remove(&user_message_ix);
+    }
+
+    pub(crate) fn is_worked_turn_cancelled(&self, user_message_ix: usize) -> bool {
+        self.cancelled_worked_turns.contains(&user_message_ix)
     }
 
     pub(crate) fn is_tool_call_expanded(&self, tool_call_id: &acp::ToolCallId) -> bool {
@@ -458,6 +484,16 @@ impl EntryViewState {
                 .and_then(|(entry_ix, chunk_ix)| {
                     reindex_after_removal(entry_ix, &range).map(|entry_ix| (entry_ix, chunk_ix))
                 });
+        self.expanded_worked_turns = self
+            .expanded_worked_turns
+            .iter()
+            .filter_map(|&entry_ix| reindex_after_removal(entry_ix, &range))
+            .collect();
+        self.cancelled_worked_turns = self
+            .cancelled_worked_turns
+            .iter()
+            .filter_map(|&entry_ix| reindex_after_removal(entry_ix, &range))
+            .collect();
     }
 
     pub fn agent_ui_font_size_changed(&mut self, cx: &mut App) {
