@@ -415,7 +415,7 @@ fn parse_mermaid_info(info: &str) -> Option<u32> {
         parts
             .next()
             .and_then(|scale| scale.parse().ok())
-            .unwrap_or(100)
+            .unwrap_or(75)
             .clamp(10, 500),
     )
 }
@@ -473,7 +473,7 @@ pub(crate) fn extract_mermaid_diagrams(
             CodeBlockKind::FencedSrc(path_range) => {
                 let path = Path::new(path_range.path.as_ref());
                 match path.extension().and_then(|ext| ext.to_str()) {
-                    Some("mermaid" | "mmd") => 100,
+                    Some("mermaid" | "mmd") => 75,
                     _ => continue,
                 }
             }

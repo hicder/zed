@@ -1607,6 +1607,16 @@ impl ConversationView {
             AcpThreadEvent::StatusChanged => {
                 if let Some(active) = self.thread_view(&session_id) {
                     active.update(cx, |active, cx| {
+                        if matches!(thread.read(cx).status(), ThreadStatus::Generating)
+                            && let Some(user_message_ix) =
+                                thread.read(cx).entries().iter().rposition(|entry| {
+                                    matches!(entry, AgentThreadEntry::UserMessage(_))
+                                })
+                        {
+                            active.entry_view_state.update(cx, |state, _cx| {
+                                state.clear_worked_turn_cancelled(user_message_ix);
+                            });
+                        }
                         active.sync_generating_indicator(cx);
                     });
                 }
@@ -1682,6 +1692,17 @@ impl ConversationView {
                     let is_generating =
                         matches!(thread.read(cx).status(), ThreadStatus::Generating);
                     active.update(cx, |active, cx| {
+                        if !is_generating
+                            && *stop_reason == acp::StopReason::Cancelled
+                            && let Some(user_message_ix) =
+                                thread.read(cx).entries().iter().rposition(|entry| {
+                                    matches!(entry, AgentThreadEntry::UserMessage(_))
+                                })
+                        {
+                            active.entry_view_state.update(cx, |state, _cx| {
+                                state.mark_worked_turn_cancelled(user_message_ix);
+                            });
+                        }
                         if !is_generating {
                             active.thread_retry_status.take();
                             active.clear_auto_expand_tracking(cx);
