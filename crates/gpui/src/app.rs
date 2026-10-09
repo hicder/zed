@@ -688,7 +688,7 @@ impl SystemWindowTabController {
                 tabs.push(tab);
             }
         } else {
-            let new_group_id = controller.tab_groups.len();
+            let new_group_id = controller.tab_groups.keys().max().map_or(0, |key| key + 1);
             controller.tab_groups.insert(new_group_id, tabs);
         }
     }
@@ -3580,8 +3580,67 @@ mod test {
 
     use crate::{
         AppContext, Context, Empty, FallbackFontClass, IntoElement, MissingGlyph, Render,
-        TestAppContext, Window,
+        SystemWindowTab, SystemWindowTabController, TestAppContext, Window,
     };
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn system_window_tabs_register_standalone_windows() -> anyhow::Result<()> {
+        let cx = TestAppContext::single();
+        cx.update(|cx| -> anyhow::Result<()> {
+            let first = cx.open_window(
+                crate::WindowOptions {
+                    tabbing_identifier: Some("zed".into()),
+                    ..Default::default()
+                },
+                |_, cx| cx.new(|_| Empty),
+            )?;
+            let second = cx.open_window(
+                crate::WindowOptions {
+                    tabbing_identifier: Some("zed".into()),
+                    ..Default::default()
+                },
+                |_, cx| cx.new(|_| Empty),
+            )?;
+            let controller = cx.global::<SystemWindowTabController>();
+            assert_eq!(controller.tab_groups().len(), 2);
+            assert_eq!(controller.tabs(first.window_id()).map(Vec::len), Some(1));
+            assert_eq!(controller.tabs(second.window_id()).map(Vec::len), Some(1));
+
+            SystemWindowTabController::merge_all_windows(cx, first.window_id());
+            assert_eq!(
+                cx.global::<SystemWindowTabController>()
+                    .tabs(first.window_id())
+                    .map(Vec::len),
+                Some(2)
+            );
+            Ok(())
+        })
+    }
+
+    #[gpui::test]
+    fn system_window_tabs_keep_groups_after_closing_and_opening(cx: &mut TestAppContext) {
+        let [first, second, third, fourth] = std::array::from_fn(|_| cx.add_window(|_, _| Empty));
+        cx.update(|cx| {
+            SystemWindowTabController::init(cx);
+            for window in [first, second, third] {
+                SystemWindowTabController::add_tab(
+                    cx,
+                    window.window_id(),
+                    vec![SystemWindowTab::new("window".into(), window.into())],
+                );
+            }
+            SystemWindowTabController::remove_tab(cx, second.window_id());
+            SystemWindowTabController::add_tab(
+                cx,
+                fourth.window_id(),
+                vec![SystemWindowTab::new("new window".into(), fourth.into())],
+            );
+            let controller = cx.global::<SystemWindowTabController>();
+            assert_eq!(controller.tab_groups().len(), 3);
+            assert_eq!(controller.tabs(third.window_id()).map(Vec::len), Some(1));
+        });
+    }
 
     struct RenderCounter(Rc<Cell<usize>>);
 
