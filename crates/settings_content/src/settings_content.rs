@@ -1381,6 +1381,11 @@ pub struct MarkdownPreviewSettingsContent {
     ///
     /// Default: 800
     pub max_width: Option<PixelSetting>,
+    /// Whether to render LaTeX math in the markdown preview: text between
+    /// `$` or `$$` delimiters, and `math` code blocks.
+    ///
+    /// Default: true
+    pub render_math: Option<bool>,
 }
 
 /// The settings for the image viewer.

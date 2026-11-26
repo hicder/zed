@@ -4,6 +4,7 @@ use crate::{
     MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, SharedString, Size, TextOverflow,
     TextRun, TextStyle, TooltipId, TruncateFrom, WhiteSpace, Window, WrappedLine,
     WrappedLineLayout, register_tooltip_mouse_handlers, set_tooltip_on_window,
+    text_system::LineInlineBox,
 };
 use anyhow::Context as _;
 use gpui_util::ResultExt;
@@ -263,7 +264,13 @@ impl Element for &'static str {
         cx: &mut App,
     ) -> (LayoutId, Self::RequestLayoutState) {
         let state = TextLayout::default();
-        let layout_id = state.layout(SharedString::new_static(self), None, window, cx);
+        let layout_id = state.layout(
+            SharedString::new_static(self),
+            None,
+            Rc::default(),
+            window,
+            cx,
+        );
         (layout_id, state)
     }
 
@@ -329,7 +336,7 @@ impl Element for SharedString {
         cx: &mut App,
     ) -> (LayoutId, Self::RequestLayoutState) {
         let state = TextLayout::default();
-        let layout_id = state.layout(self.clone(), None, window, cx);
+        let layout_id = state.layout(self.clone(), None, Rc::default(), window, cx);
         (layout_id, state)
     }
 
@@ -359,6 +366,55 @@ impl Element for SharedString {
     }
 }
 
+/// A fixed-size region reserved in a [`StyledText`] in place of a range of its text, for
+/// content such as an image or a formula that flows with the surrounding text.
+///
+/// The text in the range is not painted. It still determines indices, so hit testing
+/// anywhere inside the box resolves to the start of the range, and any index past the start
+/// of the range resolves to the box's right edge. The range must not contain a newline and
+/// must shape to at least one glyph.
+///
+/// Lines never break inside a box, which wraps like a single word. A box wider than the
+/// wrap width is scaled down to fit it. If a box is too tall for the line height, the line
+/// height of the whole text element grows to fit it. If the text is truncated, boxes are
+/// dropped and their text is painted instead.
+#[derive(Clone)]
+pub struct InlineBox {
+    range: Range<usize>,
+    width: Pixels,
+    ascent: Pixels,
+    descent: Pixels,
+    paint: Rc<dyn Fn(Bounds<Pixels>, &mut Window, &mut App)>,
+}
+
+impl InlineBox {
+    /// Creates a box in place of the text in `range`, extending `ascent` above the
+    /// baseline and `descent` below it. `paint` is called with the bounds the box was
+    /// laid out in whenever the text's foreground is painted.
+    pub fn new(
+        range: Range<usize>,
+        width: Pixels,
+        ascent: Pixels,
+        descent: Pixels,
+        paint: impl Fn(Bounds<Pixels>, &mut Window, &mut App) + 'static,
+    ) -> Self {
+        Self {
+            range,
+            width,
+            ascent,
+            descent,
+            paint: Rc::new(paint),
+        }
+    }
+
+    fn has_same_geometry(&self, other: &Self) -> bool {
+        self.range == other.range
+            && self.width == other.width
+            && self.ascent == other.ascent
+            && self.descent == other.descent
+    }
+}
+
 /// Renders text with runs of different styles.
 ///
 /// Callers are responsible for setting the correct style for each run.
@@ -369,6 +425,7 @@ pub struct StyledText {
     runs: Option<Vec<TextRun>>,
     delayed_highlights: Option<Vec<(Range<usize>, HighlightStyle)>>,
     delayed_font_family_overrides: Option<Vec<(Range<usize>, SharedString)>>,
+    inline_boxes: Rc<[InlineBox]>,
     layout: TextLayout,
 }
 
@@ -380,6 +437,7 @@ impl StyledText {
             runs: None,
             delayed_highlights: None,
             delayed_font_family_overrides: None,
+            inline_boxes: Rc::default(),
             layout: TextLayout::default(),
         }
     }
@@ -498,6 +556,28 @@ impl StyledText {
         }
     }
 
+    /// Reserve space within the text for the given boxes.
+    ///
+    /// The boxes must be sorted by range start, non-overlapping, non-empty, and on
+    /// character boundaries.
+    pub fn with_inline_boxes(mut self, inline_boxes: impl IntoIterator<Item = InlineBox>) -> Self {
+        let mut previous_end = 0;
+        self.inline_boxes = inline_boxes
+            .into_iter()
+            .inspect(|inline_box| {
+                let range = &inline_box.range;
+                assert!(
+                    previous_end <= range.start
+                        && range.start < range.end
+                        && self.text.get(range.clone()).is_some(),
+                    "invalid inline box range: {range:?}"
+                );
+                previous_end = range.end;
+            })
+            .collect();
+        self
+    }
+
     /// Set the text runs for this piece of text.
     pub fn with_runs(mut self, runs: Vec<TextRun>) -> Self {
         let mut text = &*self.text;
@@ -547,7 +627,13 @@ impl Element for StyledText {
             Self::apply_font_family_overrides(runs, overrides);
         }
 
-        let layout_id = self.layout.layout(self.text.clone(), runs, window, cx);
+        let layout_id = self.layout.layout(
+            self.text.clone(),
+            runs,
+            self.inline_boxes.clone(),
+            window,
+            cx,
+        );
         (layout_id, ())
     }
 
@@ -591,6 +677,7 @@ enum TextPaintPass {
 struct TextLayoutInner {
     len: usize,
     lines: SmallVec<[WrappedLine; 1]>,
+    inline_boxes: Rc<[InlineBox]>,
     line_height: Pixels,
     wrap_width: Option<Pixels>,
     truncate_width: Option<Pixels>,
@@ -608,6 +695,7 @@ pub(crate) struct TextMeasure {
     line_height: Pixels,
     scale_factor: f32,
     font_generation: usize,
+    inline_boxes: Rc<[InlineBox]>,
     element_state: TextLayout,
 }
 
@@ -622,6 +710,12 @@ impl TextMeasure {
             || self.font_generation != previous.font_generation
             || self.runs != previous.runs
             || self.text_style != previous.text_style
+            || self.inline_boxes.len() != previous.inline_boxes.len()
+            || !self
+                .inline_boxes
+                .iter()
+                .zip(previous.inline_boxes.iter())
+                .all(|(inline_box, previous)| inline_box.has_same_geometry(previous))
         {
             return false;
         }
@@ -641,6 +735,8 @@ impl TextMeasure {
             return false;
         };
         measured.bounds = None;
+        // The painters may have changed even though the geometry hasn't.
+        measured.inline_boxes = self.inline_boxes.clone();
         *self.element_state.0.borrow_mut() = Some(measured);
         true
     }
@@ -666,6 +762,7 @@ impl TextMeasure {
             text_style,
             font_size,
             line_height,
+            inline_boxes,
             element_state,
             ..
         } = self;
@@ -707,6 +804,19 @@ impl TextMeasure {
             return size;
         }
 
+        let line_boxes = inline_boxes
+            .iter()
+            .enumerate()
+            .map(|(box_index, inline_box)| LineInlineBox {
+                box_index,
+                range: inline_box.range.clone(),
+                width: inline_box.width,
+                ascent: inline_box.ascent,
+                descent: inline_box.descent,
+            })
+            .collect::<SmallVec<[LineInlineBox; 0]>>();
+        let original_text = text;
+
         let (text, runs) = if let Some(truncate_width) = truncate_width {
             // Taking a wrapper from the pool locks it twice and moves its
             // character width cache around, so only do it when truncating.
@@ -724,7 +834,14 @@ impl TextMeasure {
                 )
             } else if let Some(unclipped) = window
                 .text_system()
-                .shape_text(text.clone(), font_size, &runs, None, None)
+                .shape_text_with_inline_boxes(
+                    text.clone(),
+                    font_size,
+                    &runs,
+                    None,
+                    None,
+                    &line_boxes,
+                )
                 .log_err()
                 && unclipped
                     .iter()
@@ -750,20 +867,41 @@ impl TextMeasure {
             (text.clone(), Cow::Borrowed(runs.as_slice()))
         };
         let len = text.len();
+        // Truncation rewrites the text, which invalidates the ranges of the boxes.
+        let line_boxes: &[LineInlineBox] = if text == *original_text {
+            &line_boxes
+        } else {
+            &[]
+        };
 
         // Text that fails to shape is measured as empty.
         let (lines, len) = window
             .text_system()
-            .shape_text(
+            .shape_text_with_inline_boxes(
                 text,
                 font_size,
                 &runs,
                 wrap_width,            // Wrap if we know the width.
                 text_style.line_clamp, // Limit the number of lines if line_clamp is set.
+                line_boxes,
             )
             .log_err()
             .map(|lines| (lines, len))
             .unwrap_or_default();
+
+        let required_line_height = lines
+            .iter()
+            .flat_map(|line| {
+                line.inline_boxes
+                    .iter()
+                    .map(|inline_box| inline_box.min_line_height(line.ascent(), line.descent()))
+            })
+            .fold(Pixels::ZERO, Pixels::max);
+        let line_height = if required_line_height > line_height {
+            window.pixel_snap(required_line_height.ceil())
+        } else {
+            line_height
+        };
 
         let mut size: Size<Pixels> = Size::default();
         for line in &lines {
@@ -774,6 +912,7 @@ impl TextMeasure {
         if final_layout || element_state.0.borrow().is_none() {
             element_state.0.borrow_mut().replace(TextLayoutInner {
                 lines,
+                inline_boxes: inline_boxes.clone(),
                 len,
                 line_height,
                 wrap_width,
@@ -799,6 +938,7 @@ impl TextLayoutInner {
                     decoration_runs: line.decoration_runs.clone(),
                 })
                 .collect(),
+            inline_boxes: self.inline_boxes.clone(),
             line_height: self.line_height,
             wrap_width: self.wrap_width,
             truncate_width: self.truncate_width,
@@ -813,12 +953,13 @@ impl TextLayout {
         &self,
         text: SharedString,
         runs: Option<Vec<TextRun>>,
+        inline_boxes: Rc<[InlineBox]>,
         window: &mut Window,
         _: &mut App,
     ) -> LayoutId {
         window.request_keyed_measure(
             &crate::Style::default(),
-            self.measurement(text, runs, window),
+            self.measurement(text, runs, inline_boxes, window),
             TextMeasure::reuse_measurement,
             TextMeasure::measure,
         )
@@ -828,6 +969,7 @@ impl TextLayout {
         &self,
         text: SharedString,
         runs: Option<Vec<TextRun>>,
+        inline_boxes: Rc<[InlineBox]>,
         window: &Window,
     ) -> TextMeasure {
         let text_style = window.text_style();
@@ -851,6 +993,7 @@ impl TextLayout {
             line_height,
             scale_factor: window.scale_factor(),
             font_generation: window.text_system().font_generation(),
+            inline_boxes,
             element_state: self.clone(),
         }
     }
@@ -912,13 +1055,18 @@ impl TextLayout {
                 .log_err();
             }
             if matches!(pass, TextPaintPass::All | TextPaintPass::Foreground) {
-                line.paint(
+                line.paint_with_inline_boxes(
                     line_origin,
                     line_height,
                     text_style.text_align,
                     Some(bounds),
                     window,
                     cx,
+                    &mut |box_index, box_bounds, window, cx| {
+                        if let Some(inline_box) = element_state.inline_boxes.get(box_index) {
+                            (inline_box.paint)(box_bounds, window, cx);
+                        }
+                    },
                 )
                 .log_err();
             }
@@ -1376,6 +1524,183 @@ impl Element for InteractiveText {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::px;
+
+    /// Draws `text` with the given inline boxes at the window origin, returning its
+    /// layout and the bounds each box was painted in, in paint order.
+    fn draw_with_inline_boxes(
+        cx: &mut crate::VisualTestContext,
+        text: &'static str,
+        wrap_width: Pixels,
+        boxes: &[(Range<usize>, Pixels, Pixels, Pixels)],
+    ) -> (TextLayout, Vec<(usize, Bounds<Pixels>)>) {
+        let painted = Rc::new(RefCell::new(Vec::new()));
+        let inline_boxes = boxes
+            .iter()
+            .enumerate()
+            .map(|(box_index, (range, width, ascent, descent))| {
+                let painted = painted.clone();
+                InlineBox::new(
+                    range.clone(),
+                    *width,
+                    *ascent,
+                    *descent,
+                    move |bounds, _, _| painted.borrow_mut().push((box_index, bounds)),
+                )
+            })
+            .collect::<Vec<_>>();
+        let element = StyledText::new(text).with_inline_boxes(inline_boxes);
+        let layout = element.layout().clone();
+        cx.draw(
+            Point::default(),
+            crate::size(
+                crate::AvailableSpace::Definite(wrap_width),
+                crate::AvailableSpace::MinContent,
+            ),
+            |_, _| element,
+        );
+        let painted = painted.borrow().clone();
+        (layout, painted)
+    }
+
+    #[track_caller]
+    fn assert_close(actual: Pixels, expected: Pixels) {
+        assert!(
+            (actual - expected).abs() < px(0.01),
+            "{actual:?} != {expected:?}"
+        );
+    }
+
+    fn character_width(layout: &TextLayout) -> Pixels {
+        let line = &layout.line_layouts()[0];
+        line.unwrapped_layout.x_for_index(1) - line.unwrapped_layout.x_for_index(0)
+    }
+
+    #[crate::test]
+    fn inline_box_reserves_its_width_and_is_painted_there(cx: &mut crate::TestAppContext) {
+        let cx = cx.add_empty_window();
+        let (plain, _) = draw_with_inline_boxes(cx, "ab $xyz$ cd", px(1000.), &[]);
+        let character = character_width(&plain);
+
+        let (layout, painted) = draw_with_inline_boxes(
+            cx,
+            "ab $xyz$ cd",
+            px(1000.),
+            &[(3..8, px(40.), px(8.), px(2.))],
+        );
+
+        let box_start = layout.position_for_index(3).unwrap();
+        let box_end = layout.position_for_index(8).unwrap();
+        assert_close(box_start.x, character * 3.);
+        assert_close(box_end.x - box_start.x, px(40.));
+        assert_close(
+            layout.position_for_index(11).unwrap().x,
+            character * 6. + px(40.),
+        );
+
+        assert_eq!(painted.len(), 1);
+        let (_, bounds) = painted[0];
+        assert_eq!(bounds.origin.x, box_start.x);
+        assert_eq!(bounds.size, crate::size(px(40.), px(10.)));
+        assert!(bounds.top() >= Pixels::ZERO && bounds.bottom() <= layout.line_height());
+        assert_eq!(layout.line_height(), plain.line_height());
+
+        // The text a box replaces stays part of the layout.
+        assert_eq!(layout.text(), "ab $xyz$ cd");
+
+        let middle_of_row = layout.line_height() / 2.;
+        for x in [box_start.x + px(1.), box_end.x - px(1.)] {
+            assert_eq!(
+                layout.index_for_position(crate::point(x, middle_of_row)),
+                Ok(3)
+            );
+        }
+        // Indices inside the replaced text all resolve to the box's right edge.
+        for index in 4..8 {
+            assert_eq!(layout.position_for_index(index).unwrap(), box_end);
+        }
+    }
+
+    #[crate::test]
+    fn tall_inline_box_grows_the_line_height(cx: &mut crate::TestAppContext) {
+        let cx = cx.add_empty_window();
+        let (plain, _) = draw_with_inline_boxes(cx, "a $x$ b", px(1000.), &[]);
+
+        let (layout, painted) = draw_with_inline_boxes(
+            cx,
+            "a $x$ b",
+            px(1000.),
+            &[(2..5, px(20.), px(60.), px(30.))],
+        );
+
+        assert!(layout.line_height() > plain.line_height());
+        assert_eq!(layout.bounds().size.height, layout.line_height());
+        let (_, bounds) = painted[0];
+        assert!(bounds.top() >= Pixels::ZERO, "{bounds:?}");
+        assert!(bounds.bottom() <= layout.line_height(), "{bounds:?}");
+    }
+
+    #[crate::test]
+    fn lines_wrap_around_an_inline_box_like_a_word(cx: &mut crate::TestAppContext) {
+        let cx = cx.add_empty_window();
+        let (plain, _) = draw_with_inline_boxes(cx, "aaaa $b c d$. e", px(1000.), &[]);
+        let character = character_width(&plain);
+
+        // The text inside the box has spaces, but only the ones around it may break.
+        // The period stays attached to the box.
+        let (layout, painted) = draw_with_inline_boxes(
+            cx,
+            "aaaa $b c d$. e",
+            character * 10.,
+            &[(5..12, character * 8., px(8.), px(2.))],
+        );
+
+        assert_eq!(layout.wrapped_text(), "aaaa \n$b c d$. \ne");
+        let (_, bounds) = painted[0];
+        assert_eq!(bounds.origin.x, Pixels::ZERO);
+        assert!(bounds.top() >= layout.line_height());
+        assert!(bounds.bottom() <= layout.line_height() * 2.);
+    }
+
+    #[crate::test]
+    fn inline_box_wider_than_the_wrap_width_shrinks_to_fit(cx: &mut crate::TestAppContext) {
+        let cx = cx.add_empty_window();
+
+        let (_, painted) = draw_with_inline_boxes(
+            cx,
+            "$wide$",
+            px(100.),
+            &[(0..6, px(400.), px(40.), px(20.))],
+        );
+
+        assert_eq!(painted[0].1.size, crate::size(px(100.), px(15.)));
+    }
+
+    #[crate::test]
+    fn inline_boxes_are_placed_on_the_hard_line_that_contains_them(cx: &mut crate::TestAppContext) {
+        let cx = cx.add_empty_window();
+
+        let (layout, painted) = draw_with_inline_boxes(
+            cx,
+            "$a$ one\ntwo $b$$c$",
+            px(1000.),
+            &[
+                (0..3, px(11.), px(8.), px(2.)),
+                (12..15, px(22.), px(8.), px(2.)),
+                (15..18, px(33.), px(8.), px(2.)),
+            ],
+        );
+
+        assert_eq!(
+            painted
+                .iter()
+                .map(|(box_index, bounds)| (*box_index, bounds.size.width))
+                .collect::<Vec<_>>(),
+            vec![(0, px(11.)), (1, px(22.)), (2, px(33.))]
+        );
+        assert!(painted[1].1.top() >= layout.line_height());
+        assert_eq!(painted[1].1.right(), painted[2].1.left());
+    }
 
     #[crate::test]
     fn text_measurement_depends_only_on_its_inputs(cx: &mut crate::TestAppContext) {
@@ -1407,12 +1732,12 @@ mod tests {
             let fresh_size =
                 |space: Size<crate::AvailableSpace>, window: &mut Window, cx: &mut App| {
                     TextLayout::default()
-                        .measurement(text.clone(), None, window)
+                        .measurement(text.clone(), None, Rc::default(), window)
                         .measure(Size::default(), space, false, window, cx)
                 };
 
             let layout = TextLayout::default();
-            let mut measure = layout.measurement(text.clone(), None, window);
+            let mut measure = layout.measurement(text.clone(), None, Rc::default(), window);
             let narrow_size = measure.measure(Size::default(), narrow, true, window, cx);
             // An unconstrained probe measures the unwrapped text, rather than answering
             // with the size of whatever was measured before it.
@@ -1433,7 +1758,7 @@ mod tests {
             // A measure with the same inputs takes over the lines, and measures the same
             // as one measuring from scratch.
             let next_layout = TextLayout::default();
-            let mut next = next_layout.measurement(text.clone(), None, window);
+            let mut next = next_layout.measurement(text.clone(), None, Rc::default(), window);
             assert!(next.reuse_measurement(&mut measure));
             assert_eq!(painted_height(&next_layout), Some(wide_size.height));
             for space in [narrow, wide, unconstrained] {
@@ -1443,7 +1768,8 @@ mod tests {
                 );
             }
 
-            let mut changed = TextLayout::default().measurement("Other text".into(), None, window);
+            let mut changed =
+                TextLayout::default().measurement("Other text".into(), None, Rc::default(), window);
             assert!(!changed.reuse_measurement(&mut next));
         });
     }

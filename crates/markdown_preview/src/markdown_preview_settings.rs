@@ -9,6 +9,8 @@ pub struct MarkdownPreviewSettings {
     /// The maximum width of the rendered markdown content, or `None` to render
     /// content edge to edge.
     pub max_width: Option<Pixels>,
+    /// Whether to render LaTeX math.
+    pub render_math: bool,
 }
 
 impl Settings for MarkdownPreviewSettings {
@@ -22,6 +24,7 @@ impl Settings for MarkdownPreviewSettings {
         Self {
             open_markdown_files_in_preview: content.open_markdown_files_in_preview.unwrap_or(false),
             max_width,
+            render_math: content.render_math.unwrap_or(true),
         }
     }
 }

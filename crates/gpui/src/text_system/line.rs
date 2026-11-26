@@ -1,7 +1,7 @@
 use crate::{
-    App, Bounds, DevicePixels, Half, Hsla, LineLayout, Pixels, Point, RenderGlyphParams, Result,
-    SharedString, StrikethroughStyle, TextAlign, UnderlineStyle, Window, WrapBoundary,
-    WrappedLineLayout, black, fill, point, px, size, underline_y_offset,
+    App, Bounds, DevicePixels, Half, Hsla, LineLayout, Pixels, PlacedInlineBox, Point,
+    RenderGlyphParams, Result, SharedString, StrikethroughStyle, TextAlign, UnderlineStyle, Window,
+    WrapBoundary, WrappedLineLayout, black, fill, point, px, size, underline_y_offset,
 };
 use derive_more::{Deref, DerefMut};
 use smallvec::SmallVec;
@@ -149,9 +149,11 @@ impl ShapedLine {
             align_width,
             &self.decoration_runs,
             &[],
+            &[],
             window,
             cx,
             &mut paint_underline,
+            &mut |_, _, _, _| {},
         )
     }
 
@@ -405,9 +407,11 @@ impl LineLayout {
             align_width,
             decoration_runs,
             &[],
+            &[],
             window,
             cx,
             &mut |_, origin, width, style, window| window.paint_underline(origin, width, style),
+            &mut |_, _, _, _| {},
         )
     }
 
@@ -470,6 +474,29 @@ impl WrappedLine {
         window: &mut Window,
         cx: &mut App,
     ) -> Result<()> {
+        self.paint_with_inline_boxes(
+            origin,
+            line_height,
+            align,
+            bounds,
+            window,
+            cx,
+            &mut |_, _, _, _| {},
+        )
+    }
+
+    /// Like [`Self::paint`], calling `paint_inline_box` with the index and bounds of each
+    /// inline box reserved in this line.
+    pub(crate) fn paint_with_inline_boxes(
+        &self,
+        origin: Point<Pixels>,
+        line_height: Pixels,
+        align: TextAlign,
+        bounds: Option<Bounds<Pixels>>,
+        window: &mut Window,
+        cx: &mut App,
+        paint_inline_box: &mut dyn FnMut(usize, Bounds<Pixels>, &mut Window, &mut App),
+    ) -> Result<()> {
         let align_width = match bounds {
             Some(bounds) => Some(bounds.size.width),
             None => self.layout.wrap_width,
@@ -483,9 +510,11 @@ impl WrappedLine {
             align_width,
             &self.decoration_runs,
             &self.wrap_boundaries,
+            &self.layout.inline_boxes,
             window,
             cx,
             &mut |_, origin, width, style, window| window.paint_underline(origin, width, style),
+            paint_inline_box,
         )?;
 
         Ok(())
@@ -533,6 +562,7 @@ fn paint_line(
     align_width: Option<Pixels>,
     decoration_runs: &[DecorationRun],
     wrap_boundaries: &[WrapBoundary],
+    inline_boxes: &[PlacedInlineBox],
     window: &mut Window,
     cx: &mut App,
     paint_underline: &mut dyn FnMut(
@@ -542,6 +572,7 @@ fn paint_line(
         &UnderlineStyle,
         &mut Window,
     ),
+    paint_inline_box: &mut dyn FnMut(usize, Bounds<Pixels>, &mut Window, &mut App),
 ) -> Result<()> {
     window.paint_layer(|window| {
         let padding_top = (line_height - layout.ascent - layout.descent) / 2.;
@@ -720,6 +751,21 @@ fn paint_line(
                         glyph_origin.x - strikethrough_origin.x,
                         &strikethrough_style,
                     );
+                }
+
+                if let Some(inline_box) = inline_boxes
+                    .iter()
+                    .find(|inline_box| inline_box.index == glyph.index)
+                {
+                    let bounds = Bounds {
+                        origin: point(
+                            glyph_origin.x,
+                            glyph_origin.y + baseline_offset.y - inline_box.ascent,
+                        ),
+                        size: size(inline_box.width, inline_box.ascent + inline_box.descent),
+                    };
+                    paint_inline_box(inline_box.box_index, bounds, window, cx);
+                    continue;
                 }
 
                 let max_glyph_bounds = Bounds {
@@ -1269,6 +1315,7 @@ mod tests {
                             glyph_ix: 2,
                         }]),
                         wrap_width: Some(px(16.)),
+                        inline_boxes: Vec::new(),
                     }),
                     text: line.text,
                     decoration_runs: line.decoration_runs.into_vec(),
@@ -1288,12 +1335,14 @@ mod tests {
                     Some(px(16.)),
                     &wrapped.decoration_runs,
                     &wrapped.wrap_boundaries,
+                    &[],
                     window,
                     cx,
                     &mut |range, origin, width, style, window| {
                         strokes.push((range, origin, width, *style));
                         window.paint_underline(origin, width, style);
                     },
+                    &mut |_, _, _, _| {},
                 )
                 .unwrap();
                 let (start, width) = if zero_advance {

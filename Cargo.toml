@@ -144,6 +144,7 @@ members = [
     "crates/lsp_locations",
     "crates/markdown",
     "crates/markdown_preview",
+    "crates/math_render",
     "crates/menu",
     "crates/mermaid_render",
     "crates/migrator",
@@ -423,6 +424,7 @@ lsp_command_selector = { path = "crates/lsp_command_selector" }
 lsp_locations = { path = "crates/lsp_locations" }
 markdown = { path = "crates/markdown" }
 markdown_preview = { path = "crates/markdown_preview" }
+math_render = { path = "crates/math_render" }
 menu = { path = "crates/menu" }
 mermaid_render = { path = "crates/mermaid_render" }
 migrator = { path = "crates/migrator" }
@@ -873,6 +875,11 @@ pulldown-cmark = { version = "0.13.0", default-features = false }
 quick-xml = "0.41"
 quote = "1.0.9"
 rand = { version = "0.9", default-features = false, features = ["std", "std_rng", "os_rng"] }
+# RaTeX is young, so upgrades should be deliberate. All of its crates move together.
+ratex-layout = "=0.1.16"
+ratex-parser = "=0.1.16"
+ratex-svg = { version = "=0.1.16", features = ["embed-fonts"] }
+ratex-types = "=0.1.16"
 raw-window-handle = "0.6"
 rayon = "1.8"
 regex = { version = "1.5", default-features = false, features = ["std", "perf"] }

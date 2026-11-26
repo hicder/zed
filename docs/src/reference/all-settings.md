@@ -4233,7 +4233,8 @@ Changes apply without restarting Zed.
     "heading_font_weight": 600,
     "open_markdown_files_in_preview": false,
     "limit_content_width": true,
-    "max_width": 800
+    "max_width": 800,
+    "render_math": true
   }
 }
 ```
@@ -4247,6 +4248,7 @@ Changes apply without restarting Zed.
 - `open_markdown_files_in_preview`: Whether to open Markdown files in the rendered preview automatically.
 - `limit_content_width`: Whether to constrain and center preview content using `max_width`.
 - `max_width`: Maximum content width in pixels when `limit_content_width` is enabled.
+- `render_math`: Whether to render LaTeX math written as `$...$`, `$$...$$`, or in `math` code blocks.
 
 ## Mermaid Font Family {#mermaid-font-family}
 

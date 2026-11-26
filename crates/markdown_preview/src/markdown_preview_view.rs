@@ -27,7 +27,7 @@ use markdown::{
 };
 use project::search::SearchQuery;
 use project::{Project, ProjectPath, image_store};
-use settings::{SeedQuerySetting, Settings, update_settings_file};
+use settings::{SeedQuerySetting, Settings, SettingsStore, update_settings_file};
 use theme::{SystemAppearance, Theme, ThemeRegistry};
 use theme_settings::ThemeSettings;
 use ui::utils::WithRemSize;
@@ -75,6 +75,7 @@ pub struct MarkdownPreviewView {
     focus_handle: FocusHandle,
     markdown: Entity<Markdown>,
     _markdown_subscription: Subscription,
+    _settings_subscription: Subscription,
     active_source_index: Option<usize>,
     scroll_handle: ScrollHandle,
     image_cache: Entity<RetainAllImageCache>,
@@ -396,6 +397,7 @@ impl MarkdownPreviewView {
                     MarkdownOptions {
                         parse_html: true,
                         render_mermaid_diagrams: true,
+                        render_math: MarkdownPreviewSettings::get_global(cx).render_math,
                         parse_heading_slugs: true,
                         render_metadata_blocks: true,
                         ..Default::default()
@@ -417,6 +419,14 @@ impl MarkdownPreviewView {
                             cx.emit(SearchEvent::MatchesInvalidated);
                         }
                         this.markdown_parse_pending = is_parsing;
+                    },
+                ),
+                _settings_subscription: cx.observe_global::<SettingsStore>(
+                    |this: &mut Self, cx| {
+                        let render_math = MarkdownPreviewSettings::get_global(cx).render_math;
+                        this.markdown.update(cx, |markdown, cx| {
+                            markdown.set_render_math(render_math, cx);
+                        });
                     },
                 ),
                 markdown,

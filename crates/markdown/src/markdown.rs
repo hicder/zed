@@ -1,4 +1,5 @@
 pub mod html;
+mod math;
 mod mermaid;
 pub mod parser;
 mod path_range;
@@ -11,6 +12,7 @@ use gpui::UnderlineStyle;
 use language::LanguageName;
 
 use log::Level;
+use math::{MathExpression, MathExpressions, ParsedMath, drop_unused_images, typeset_math};
 use mermaid::{
     MermaidState, ParsedMarkdownMermaidDiagram, extract_mermaid_diagrams, render_mermaid_diagram,
 };
@@ -44,9 +46,11 @@ use language::{
     Bias, CharClassifier, Language, LanguageRegistry, OffsetUtf16, ResolvedHighlights, Rope,
 };
 use parser::CodeBlockMetadata;
+#[cfg(test)]
+use parser::parse_markdown_with_options;
 use parser::{
     MarkdownEvent, MarkdownTag, MarkdownTagEnd, ParsedMetadataBlock, parse_links_only,
-    parse_markdown_with_options,
+    parse_markdown_with_math,
 };
 use pulldown_cmark::{Alignment, BlockQuoteKind};
 use sum_tree::TreeMap;
@@ -534,6 +538,9 @@ pub struct MarkdownOptions {
     pub parse_links_only: bool,
     pub parse_html: bool,
     pub render_mermaid_diagrams: bool,
+    /// Draws `$...$`, `$$...$$`, and `math` code blocks as typeset math. This is opt-in
+    /// because dollar signs are common in text that isn't math.
+    pub render_math: bool,
     pub parse_heading_slugs: bool,
     pub render_metadata_blocks: bool,
     /// Defers parsing until the first [`MarkdownElement`] layout or [`Markdown::ensure_parsed`].
@@ -744,8 +751,19 @@ impl Markdown {
             search_highlights: Rc::default(),
             active_search_highlight: None,
         };
+        cx.on_release(|this: &mut Self, cx| {
+            drop_unused_images(&this.parsed_markdown.math, &MathExpressions::new(), cx);
+        })
+        .detach();
         this.parse(cx);
         this
+    }
+
+    pub fn set_render_math(&mut self, render_math: bool, cx: &mut Context<Self>) {
+        if self.options.render_math != render_math {
+            self.options.render_math = render_math;
+            self.parse(cx);
+        }
     }
 
     pub fn new_text(source: SharedString, cx: &mut Context<Self>) -> Self {
@@ -1257,6 +1275,7 @@ impl Markdown {
             self.pending_parse.take();
             self.pending_heading_scroll = None;
             self.pending_autoscroll = None;
+            drop_unused_images(&self.parsed_markdown.math, &MathExpressions::new(), cx);
             self.parsed_markdown = ParsedMarkdown {
                 source: self.source.clone(),
                 ..Default::default()
@@ -1281,6 +1300,8 @@ impl Markdown {
         let should_parse_links_only = self.options.parse_links_only;
         let should_parse_html = self.options.parse_html;
         let should_render_mermaid_diagrams = self.options.render_mermaid_diagrams;
+        let should_render_math = self.options.render_math;
+        let previous_math = self.parsed_markdown.math.clone();
         let should_parse_heading_slugs = self.options.parse_heading_slugs;
         let should_parse_metadata_blocks = self.options.render_metadata_blocks;
         let language_registry = self.language_registry.clone();
@@ -1298,6 +1319,7 @@ impl Markdown {
                         html_blocks: BTreeMap::default(),
                         metadata_blocks: BTreeMap::default(),
                         mermaid_diagrams: BTreeMap::default(),
+                        math: MathExpressions::default(),
                         heading_slugs: HashMap::default(),
                         footnote_definitions: HashMap::default(),
                         link_definition_spans: Arc::default(),
@@ -1308,11 +1330,12 @@ impl Markdown {
                 );
             }
 
-            let parsed = parse_markdown_with_options(
+            let parsed = parse_markdown_with_math(
                 &source,
                 should_parse_html,
                 should_parse_heading_slugs,
                 should_parse_metadata_blocks,
+                should_render_math,
             );
             let events = parsed.events;
             let language_names = parsed.language_names;
@@ -1328,6 +1351,11 @@ impl Markdown {
                 extract_mermaid_diagrams(&source, &events)
             } else {
                 BTreeMap::default()
+            };
+            let math = if should_render_math {
+                typeset_math(&source, &events, &previous_math)
+            } else {
+                MathExpressions::default()
             };
             let mut images_by_source_offset = HashMap::default();
             let mut languages_by_name = TreeMap::default();
@@ -1395,6 +1423,7 @@ impl Markdown {
                 html_blocks,
                 metadata_blocks,
                 mermaid_diagrams,
+                math,
                 heading_slugs,
                 footnote_definitions,
                 link_definition_spans: Arc::from(link_definition_spans),
@@ -1409,6 +1438,7 @@ impl Markdown {
             let (parsed, images_by_source_offset) = parsed.await;
 
             this.update(cx, |this, cx| {
+                drop_unused_images(&this.parsed_markdown.math, &parsed.math, cx);
                 this.parsed_markdown = parsed;
                 this.images_by_source_offset = images_by_source_offset;
                 if this.active_root_block.is_some_and(|block_index| {
@@ -1552,6 +1582,7 @@ pub struct ParsedMarkdown {
     pub(crate) html_blocks: BTreeMap<usize, html::html_parser::ParsedHtmlBlock>,
     pub(crate) metadata_blocks: BTreeMap<usize, ParsedMetadataBlock>,
     pub(crate) mermaid_diagrams: BTreeMap<usize, ParsedMarkdownMermaidDiagram>,
+    pub(crate) math: MathExpressions,
     pub heading_slugs: HashMap<SharedString, usize>,
     pub footnote_definitions: HashMap<SharedString, usize>,
     pub(crate) link_definition_spans: Arc<[Range<usize>]>,
@@ -1639,7 +1670,9 @@ impl ParsedMarkdown {
                 MarkdownEvent::Text
                 | MarkdownEvent::SubstitutedText(_)
                 | MarkdownEvent::Code
-                | MarkdownEvent::SubstitutedCode(_) => {
+                | MarkdownEvent::SubstitutedCode(_)
+                | MarkdownEvent::InlineMath(_)
+                | MarkdownEvent::DisplayMath(_) => {
                     let Some((link_range, cursor)) = active_link.as_mut() else {
                         continue;
                     };
@@ -2040,6 +2073,88 @@ impl MarkdownElement {
             builder.push_code_chip_text(text, range, chip_background);
             builder.pop_text_style();
         }
+    }
+
+    fn push_markdown_inline_math(
+        &self,
+        builder: &mut MarkdownElementBuilder,
+        tex: &str,
+        math: Option<&ParsedMath>,
+        range: &Range<usize>,
+    ) {
+        // A line of text can't hold a line break within a formula.
+        let text = format!("${}$", tex.replace(['\r', '\n'], " "));
+        match math {
+            Some(math) if math.expression.error().is_none() => {
+                builder.push_math_text(&text, range.clone(), math.expression.clone());
+            }
+            _ => {
+                let mut code_style = self.style.inline_code.clone();
+                let chip_background = code_style.background_color.take();
+                builder.push_text_style(code_style);
+                builder.push_code_chip_text(&text, range.clone(), chip_background);
+                builder.pop_text_style();
+            }
+        }
+    }
+
+    fn push_markdown_display_math(
+        &self,
+        builder: &mut MarkdownElementBuilder,
+        math: &ParsedMath,
+        range: &Range<usize>,
+        markdown_end: usize,
+    ) {
+        // Whitespace between this and an earlier block of math doesn't need its own line.
+        if builder.pending_line.text.trim().is_empty() {
+            builder.pending_line = PendingLine::default();
+        }
+        let start = range.start;
+        if let Some(error) = math.expression.error() {
+            let error = error.clone();
+            let mut container = div()
+                .id(("markdown-math-error", start))
+                .debug_selector(move || format!("markdown_math_error_{start}"))
+                .w_full()
+                .when(!self.style.prevent_mouse_interaction, |this| {
+                    this.tooltip(Tooltip::text(error))
+                });
+            container.style().refine(&self.style.code_block);
+            builder.push_div(container, range, markdown_end);
+            builder.push_text_style(self.style.code_block.text.clone());
+            builder.push_text(&format!("$${}$$", math.tex()), range.clone());
+            builder.pop_div();
+            builder.pop_text_style();
+            return;
+        }
+
+        // Wide formulas scroll instead of shrinking or wrapping, and the rest are
+        // centered.
+        builder.push_div(
+            div()
+                .id(("markdown-display-math", start))
+                .debug_selector(move || format!("markdown_display_math_{start}"))
+                .w_full()
+                .min_w_0()
+                .flex()
+                .py_1()
+                .mb_2()
+                .overflow_x_scroll()
+                .restrict_scroll_to_axis()
+                .whitespace_nowrap(),
+            range,
+            markdown_end,
+        );
+        builder.push_div(div().flex_none().mx_auto(), range, markdown_end);
+        builder.push_text_style(TextStyleRefinement {
+            text_align: Some(TextAlign::Left),
+            ..Default::default()
+        });
+        let text = format!("$${}$$", math.tex().replace(['\r', '\n'], " "));
+        builder.push_math_text(&text, range.clone(), math.expression.clone());
+        builder.pop_div();
+        builder.pop_div();
+        builder.pop_text_style();
     }
 
     fn push_markdown_image(
@@ -2769,7 +2884,8 @@ impl Element for MarkdownElement {
         let mut current_img_block_range: Option<Range<usize>> = None;
         let mut link_destination = None;
         let mut handled_html_block = false;
-        let mut rendered_mermaid_block = false;
+        // Set while skipping the events of a code block that was drawn as something else.
+        let mut replaced_code_block = false;
         let mut rendered_metadata_block = false;
         for (index, (range, event)) in parsed_markdown.events.iter().enumerate() {
             let event_index = MarkdownEventIndex(index);
@@ -2788,9 +2904,9 @@ impl Element for MarkdownElement {
                 }
             }
 
-            if rendered_mermaid_block {
+            if replaced_code_block {
                 if matches!(event, MarkdownEvent::End(MarkdownTagEnd::CodeBlock)) {
-                    rendered_mermaid_block = false;
+                    replaced_code_block = false;
                 }
                 continue;
             }
@@ -2887,6 +3003,17 @@ impl Element for MarkdownElement {
                             );
                         }
                         MarkdownTag::CodeBlock { kind, .. } => {
+                            if let Some(math) = parsed_markdown.math.get(&range.start) {
+                                self.push_markdown_display_math(
+                                    &mut builder,
+                                    math,
+                                    range,
+                                    markdown_end,
+                                );
+                                replaced_code_block = true;
+                                continue;
+                            }
+
                             if render_mermaid_diagrams
                                 && let Some(mermaid_diagram) =
                                     parsed_markdown.mermaid_diagrams.get(&range.start)
@@ -2921,7 +3048,7 @@ impl Element for MarkdownElement {
                                         cx,
                                     ),
                                 );
-                                rendered_mermaid_block = true;
+                                replaced_code_block = true;
                                 continue;
                             }
 
@@ -3441,6 +3568,19 @@ impl Element for MarkdownElement {
                 MarkdownEvent::SubstitutedCode(text) => {
                     self.push_markdown_code_span(&mut builder, text, range.clone(), cx);
                 }
+                MarkdownEvent::InlineMath(tex) => {
+                    self.push_markdown_inline_math(
+                        &mut builder,
+                        tex,
+                        parsed_markdown.math.get(&range.start),
+                        range,
+                    );
+                }
+                MarkdownEvent::DisplayMath(_) => {
+                    if let Some(math) = parsed_markdown.math.get(&range.start) {
+                        self.push_markdown_display_math(&mut builder, math, range, markdown_end);
+                    }
+                }
                 MarkdownEvent::Html => {
                     let html = &parsed_markdown.source[range.clone()];
                     if html.starts_with("<!--") {
@@ -3491,6 +3631,13 @@ impl Element for MarkdownElement {
                     );
                     builder.pop_div()
                 }
+                MarkdownEvent::SoftBreak | MarkdownEvent::HardBreak
+                    if index
+                        .checked_sub(1)
+                        .and_then(|previous| parsed_markdown.events.get(previous))
+                        .is_some_and(|(_, previous)| {
+                            matches!(previous, MarkdownEvent::DisplayMath(_))
+                        }) => {}
                 MarkdownEvent::SoftBreak if !self.style.soft_break_as_hard_break => {
                     builder.push_soft_break(range.clone());
                 }
@@ -3608,7 +3755,9 @@ fn collect_image_alt_text(
     for (range, event) in events_from_image_start.iter().skip(1) {
         match event {
             MarkdownEvent::End(MarkdownTagEnd::Image) => break,
-            MarkdownEvent::Text => alt_text.push_str(&source[range.clone()]),
+            MarkdownEvent::Text | MarkdownEvent::InlineMath(_) | MarkdownEvent::DisplayMath(_) => {
+                alt_text.push_str(&source[range.clone()])
+            }
             _ => {}
         }
     }
@@ -4007,6 +4156,15 @@ struct PendingLine {
     /// Rendered (not source) indices, so chips hug the glyphs and ignore
     /// unrendered characters like the surrounding backticks
     code_chips: Vec<(Range<usize>, Hsla)>,
+    math: Vec<LineMath>,
+}
+
+/// Typeset math drawn in place of some of a line's text.
+struct LineMath {
+    rendered_range: Range<usize>,
+    source_range: Range<usize>,
+    color: Hsla,
+    expression: Arc<MathExpression>,
 }
 
 struct ListStackEntry {
@@ -4063,6 +4221,23 @@ impl MarkdownElementBuilder {
                     .push((chip_start..chip_end, background));
             }
         }
+    }
+
+    /// Pushes the source of a formula, which is drawn typeset in place of the text.
+    fn push_math_text(
+        &mut self,
+        text: &str,
+        source_range: Range<usize>,
+        expression: Arc<MathExpression>,
+    ) {
+        let rendered_start = self.pending_line.text.len();
+        self.push_text(text, source_range.clone());
+        self.pending_line.math.push(LineMath {
+            rendered_range: rendered_start..self.pending_line.text.len(),
+            source_range,
+            color: self.text_style().color,
+            expression,
+        });
     }
 
     fn push_text_style(&mut self, style: TextStyleRefinement) {
@@ -4447,6 +4622,7 @@ impl MarkdownElementBuilder {
             text_align: TextAlign::Left,
             highlights: SmallVec::new(),
             code_chips: SmallVec::new(),
+            math: Vec::new(),
         }));
         div()
             .absolute()
@@ -4486,6 +4662,7 @@ impl MarkdownElementBuilder {
             text_align,
             highlights,
             code_chips: line.code_chips.into_iter().collect(),
+            math: line.math,
         });
         self.rendered_lines.push(rendered_line.clone());
         self.append_child(
@@ -4538,6 +4715,16 @@ impl Element for RenderedLineElement {
         window: &mut Window,
         cx: &mut App,
     ) -> (gpui::LayoutId, Self::RequestLayoutState) {
+        if !self.line.math.is_empty() {
+            // The size of math follows the font size, which is only known now.
+            let font_size = window.text_style().font_size.to_pixels(window.rem_size());
+            let inline_boxes = self.line.math.iter().filter_map(|math| {
+                math.expression
+                    .inline_box(math.rendered_range.clone(), font_size, math.color)
+            });
+            self.text = mem::replace(&mut self.text, StyledText::new(SharedString::default()))
+                .with_inline_boxes(inline_boxes.collect::<Vec<_>>());
+        }
         self.text.request_layout(None, inspector_id, window, cx)
     }
 
@@ -4586,6 +4773,8 @@ struct RenderedLine {
     highlights: SmallVec<[(Range<usize>, Hsla); 1]>,
     /// Inline code chip ranges intersecting this line, in rendered indices
     code_chips: SmallVec<[(Range<usize>, Hsla); 1]>,
+    /// Sorted by rendered range
+    math: Vec<LineMath>,
 }
 
 impl RenderedLine {
@@ -4717,8 +4906,18 @@ impl RenderedLine {
         let line_bounds = layout.bounds();
         let line_height = layout.line_height();
 
-        let rendered_start = rendered_range.start;
-        let rendered_end = rendered_range.end;
+        let mut rendered_start = rendered_range.start;
+        let mut rendered_end = rendered_range.end;
+        // A formula is drawn as a whole, so covering any of it covers all of it.
+        if rendered_start < rendered_end {
+            for math in &self.math {
+                let math_range = &math.rendered_range;
+                if math_range.start < rendered_end && rendered_start < math_range.end {
+                    rendered_start = rendered_start.min(math_range.start);
+                    rendered_end = rendered_end.max(math_range.end);
+                }
+            }
+        }
 
         for wrapped_line_segment in wrapped_line_segments {
             if wrapped_line_segment.start >= rendered_end {
@@ -5171,6 +5370,15 @@ impl RenderedText {
     }
 
     fn surrounding_word_range(&self, source_index: usize) -> Range<usize> {
+        let formula = self
+            .lines
+            .iter()
+            .flat_map(|line| &line.math)
+            .find(|math| math.source_range.contains(&source_index));
+        if let Some(formula) = formula {
+            return formula.source_range.clone();
+        }
+
         for line in self.lines.iter() {
             if source_index > line.source_end {
                 continue;
@@ -9226,6 +9434,325 @@ mod tests {
                 )
                 .expect("test svg should render")
         })
+    }
+
+    fn draw_math_markdown(
+        source: &str,
+        render_math: bool,
+        width: Pixels,
+        cx: &mut TestAppContext,
+    ) -> (Entity<Markdown>, RenderedText) {
+        ensure_theme_initialized(cx);
+        let markdown = cx.new(|cx| {
+            Markdown::new_with_options(
+                source.to_string().into(),
+                None,
+                None,
+                MarkdownOptions {
+                    render_math,
+                    ..MarkdownOptions::default()
+                },
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        let rendered = draw_markdown(markdown.clone(), width, cx);
+        (markdown, rendered)
+    }
+
+    fn draw_markdown(
+        markdown: Entity<Markdown>,
+        width: Pixels,
+        cx: &mut TestAppContext,
+    ) -> RenderedText {
+        render_markdown_entity_in_view(markdown, MarkdownStyle::default(), None, Some(width), cx)
+    }
+
+    fn typeset_ranges(rendered: &RenderedText) -> Vec<Range<usize>> {
+        rendered
+            .lines
+            .iter()
+            .flat_map(|line| &line.math)
+            .map(|math| math.source_range.clone())
+            .collect()
+    }
+
+    fn visible_line_texts(rendered: &RenderedText) -> Vec<String> {
+        rendered
+            .lines
+            .iter()
+            .map(|line| line.layout.text())
+            .filter(|text| text != "\u{200B}")
+            .collect()
+    }
+
+    #[gpui::test]
+    fn test_inline_math_is_drawn_in_place_of_its_source(cx: &mut TestAppContext) {
+        let source = "before $x^2$ after";
+        let (_, rendered) = draw_math_markdown(source, true, px(600.), cx);
+
+        assert_eq!(typeset_ranges(&rendered), vec![7..12]);
+        assert_eq!(visible_line_texts(&rendered), vec![source.to_string()]);
+        let box_bounds = rendered.bounds_for_source_range(7..12);
+        assert_eq!(box_bounds.len(), 1);
+
+        // Covering any part of a formula covers all of it.
+        assert_eq!(rendered.bounds_for_source_range(9..10), box_bounds);
+
+        // Double clicking a formula selects the whole thing, and copying it gives its
+        // source back.
+        assert_eq!(rendered.surrounding_word_range(7), 7..12);
+        assert_eq!(rendered.text_for_range(7..12), "$x^2$");
+        assert_eq!(rendered.text_for_range(0..source.len()), source);
+
+        // Painting the text draws the formula.
+        let formula = &rendered.lines[0].math[0];
+        assert_eq!(formula.expression.raster_colors().len(), 1);
+    }
+
+    #[gpui::test]
+    fn test_math_is_drawn_in_the_color_of_the_surrounding_text(cx: &mut TestAppContext) {
+        let (_, rendered) =
+            draw_math_markdown("$x$ and [$x$](https://zed.dev)", true, px(600.), cx);
+
+        let formulas = rendered
+            .lines
+            .iter()
+            .flat_map(|line| &line.math)
+            .collect::<Vec<_>>();
+        assert_eq!(formulas.len(), 2);
+        assert!(Arc::ptr_eq(
+            &formulas[0].expression,
+            &formulas[1].expression
+        ));
+        let to_bytes = |color: Hsla| {
+            let color = gpui::Rgba::from(color);
+            [color.r, color.g, color.b, color.a].map(|channel| (channel * 255.).round() as u8)
+        };
+        let mut expected = vec![to_bytes(formulas[0].color)];
+        if formulas[1].color != formulas[0].color {
+            expected.push(to_bytes(formulas[1].color));
+        }
+        assert_eq!(formulas[0].expression.raster_colors(), expected);
+    }
+
+    #[gpui::test]
+    fn test_display_math_and_math_code_blocks(cx: &mut TestAppContext) {
+        let source = "$$a$$\n$$\nb\n$$\n\n```math\nc\n```";
+        let (_, rendered) = draw_math_markdown(source, true, px(600.), cx);
+
+        assert_eq!(
+            typeset_ranges(&rendered),
+            vec![0..5, 6..13, 15..source.len()]
+        );
+        // Breaks between formulas don't add empty lines.
+        assert_eq!(
+            visible_line_texts(&rendered),
+            vec!["$$a$$", "$$b$$", "$$c$$"]
+        );
+        for line in rendered.lines.iter().filter(|line| !line.math.is_empty()) {
+            let bounds = line.layout.bounds();
+            assert!(
+                (bounds.center().x - px(300.)).abs() < px(2.),
+                "display math should be centered: {bounds:?}"
+            );
+        }
+    }
+
+    #[gpui::test]
+    fn test_display_math_has_room_inside_other_blocks(cx: &mut TestAppContext) {
+        for source in [
+            "| $$a+b+c$$ |\n|---|\n| $$d+e+f$$ |",
+            "- $$a+b+c$$\n- item\n\n  $$d+e+f$$",
+            "> $$a+b+c$$",
+            "text[^note]\n\n[^note]: $$a+b+c$$",
+            "# $$a+b+c$$",
+            "**$$a+b+c$$** and [$$d+e+f$$](https://zed.dev)",
+        ] {
+            for table_columns_min_size in [false, true] {
+                let (markdown, _) = draw_math_markdown(source, true, px(600.), cx);
+                let style = MarkdownStyle {
+                    table_columns_min_size,
+                    ..MarkdownStyle::default()
+                };
+                let rendered = render_markdown_entity_in_view(markdown, style, None, None, cx);
+
+                let formulas = typeset_ranges(&rendered);
+                assert!(!formulas.is_empty(), "{source:?}");
+                for formula in formulas {
+                    let line = rendered
+                        .lines
+                        .iter()
+                        .find(|line| line.math.iter().any(|math| math.source_range == formula))
+                        .expect("the formula should have a line");
+                    let formula_bounds = rendered.bounds_for_source_range(formula.clone())[0];
+                    let visible_bounds = line
+                        .visible_bounds
+                        .get()
+                        .expect("the formula should be laid out");
+                    assert!(
+                        visible_bounds.size.width >= formula_bounds.size.width - px(1.),
+                        "{source:?}, min size columns: {table_columns_min_size}: only \
+                         {visible_bounds:?} of {formula_bounds:?} is visible"
+                    );
+                }
+            }
+        }
+    }
+
+    #[gpui::test]
+    fn test_wide_display_math_keeps_its_size(cx: &mut TestAppContext) {
+        let source = format!("$${}1$$", "x + ".repeat(40));
+        let (_, wide) = draw_math_markdown(&source, true, px(2000.), cx);
+        let (_, narrow) = draw_math_markdown(&source, true, px(200.), cx);
+
+        let formula_width = |rendered: &RenderedText| {
+            rendered.bounds_for_source_range(0..source.len())[0]
+                .size
+                .width
+        };
+        assert!(formula_width(&narrow) > px(200.));
+        assert_eq!(formula_width(&narrow), formula_width(&wide));
+    }
+
+    #[gpui::test]
+    fn test_wide_display_math_scrolls_horizontally(cx: &mut TestAppContext) {
+        ensure_theme_initialized(cx);
+        let source = format!("$${}1$$", "x + ".repeat(40));
+        let markdown = cx.new(|cx| {
+            Markdown::new_with_options(
+                source.into(),
+                None,
+                None,
+                MarkdownOptions {
+                    render_math: true,
+                    ..MarkdownOptions::default()
+                },
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        let rendered_text = Rc::new(RefCell::new(None));
+        let (_, cx) = cx.add_window_view({
+            let rendered_text = rendered_text.clone();
+            move |_, _| MarkdownTestView {
+                markdown,
+                style: MarkdownStyle::default(),
+                code_span_link: None,
+                rendered_text,
+            }
+        });
+        cx.simulate_resize(size(px(200.), px(600.)));
+        cx.run_until_parked();
+        let formula_left = || {
+            rendered_text
+                .borrow()
+                .as_ref()
+                .and_then(|rendered: &RenderedText| {
+                    rendered
+                        .lines
+                        .iter()
+                        .find(|line| !line.math.is_empty())
+                        .map(|line| line.layout.bounds().left())
+                })
+                .expect("the formula should be rendered")
+        };
+        let left_before_scrolling = formula_left();
+        let container = cx
+            .debug_bounds("markdown_display_math_0")
+            .expect("display math should have a container");
+        // A formula too wide to center starts at the beginning.
+        assert_eq!(left_before_scrolling, container.left());
+
+        cx.simulate_event(gpui::ScrollEvent {
+            position: container.center(),
+            delta: gpui::ScrollDelta::Pixels(point(px(-50.), px(0.))),
+            ..Default::default()
+        });
+        cx.run_until_parked();
+
+        assert_eq!(formula_left(), left_before_scrolling - px(50.));
+    }
+
+    #[gpui::test]
+    fn test_invalid_math_shows_its_source(cx: &mut TestAppContext) {
+        let source = "bad $\\notacommand$ inline\n\n$$\\frac{x}$$";
+        let (markdown, _) = draw_math_markdown(source, true, px(600.), cx);
+        let chip_color = gpui::red();
+        let style = MarkdownStyle {
+            inline_code: TextStyleRefinement {
+                background_color: Some(chip_color),
+                ..Default::default()
+            },
+            ..MarkdownStyle::default()
+        };
+        let rendered = render_markdown_entity_in_view(markdown.clone(), style, None, None, cx);
+
+        assert!(typeset_ranges(&rendered).is_empty());
+        assert_eq!(
+            visible_line_texts(&rendered),
+            vec!["bad $\\notacommand$ inline", "$$\\frac{x}$$"]
+        );
+        // The inline formula is set apart as code.
+        let chips = rendered
+            .lines
+            .iter()
+            .flat_map(|line| {
+                let text = line.layout.text();
+                line.code_chips
+                    .iter()
+                    .map(|(range, color)| (text[range.clone()].to_string(), *color))
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(chips, vec![("$\\notacommand$".to_string(), chip_color)]);
+        markdown.read_with(cx, |markdown, _| {
+            let errors = markdown
+                .parsed_markdown
+                .math
+                .values()
+                .filter(|math| math.expression.error().is_some())
+                .count();
+            assert_eq!(errors, 2);
+        });
+    }
+
+    #[gpui::test]
+    fn test_math_is_plain_text_unless_enabled(cx: &mut TestAppContext) {
+        let source = "$x$ and $$y$$";
+        let (markdown, rendered) = draw_math_markdown(source, false, px(600.), cx);
+        assert!(typeset_ranges(&rendered).is_empty());
+        assert_eq!(visible_line_texts(&rendered), vec![source.to_string()]);
+
+        markdown.update(cx, |markdown, cx| markdown.set_render_math(true, cx));
+        cx.run_until_parked();
+        let rendered = draw_markdown(markdown, px(600.), cx);
+        assert_eq!(typeset_ranges(&rendered), vec![0..3, 8..13]);
+    }
+
+    #[gpui::test]
+    fn test_unchanged_math_is_not_typeset_again(cx: &mut TestAppContext) {
+        let (markdown, _) = draw_math_markdown("$a$ $b$", true, px(600.), cx);
+        let expressions = |markdown: &Markdown, _: &App| {
+            markdown
+                .parsed_markdown
+                .math
+                .values()
+                .map(|math| math.expression.clone())
+                .collect::<Vec<_>>()
+        };
+        let before = markdown.read_with(cx, expressions);
+        assert_eq!(before[1].raster_colors().len(), 1);
+
+        markdown.update(cx, |markdown, cx| markdown.replace("text $a$ $c$", cx));
+        cx.run_until_parked();
+        let after = markdown.read_with(cx, expressions);
+
+        assert!(Arc::ptr_eq(&before[0], &after[0]));
+        assert!(!Arc::ptr_eq(&before[1], &after[1]));
+        // Only the images of removed formulas are freed.
+        assert_eq!(before[0].raster_colors().len(), 1);
+        assert_eq!(before[1].raster_colors().len(), 0);
     }
 
     const REVIEW_TABLE: &str = concat!(

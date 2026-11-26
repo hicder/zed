@@ -8,6 +8,7 @@ pub use font_fallbacks::*;
 pub use font_features::*;
 pub use line::*;
 pub use line_layout::*;
+pub(crate) use line_layout::{LineInlineBox, PlacedInlineBox};
 pub use line_wrapper::*;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -732,6 +733,21 @@ impl WindowTextSystem {
         wrap_width: Option<Pixels>,
         line_clamp: Option<usize>,
     ) -> Result<SmallVec<[WrappedLine; 1]>> {
+        self.shape_text_with_inline_boxes(text, font_size, runs, wrap_width, line_clamp, &[])
+    }
+
+    /// Like [`Self::shape_text`], but reserving space for inline boxes, whose ranges are
+    /// byte ranges of `text`. They must be sorted, disjoint, and on character boundaries,
+    /// and a box that spans a newline is ignored.
+    pub(crate) fn shape_text_with_inline_boxes(
+        &self,
+        text: SharedString,
+        font_size: Pixels,
+        runs: &[TextRun],
+        wrap_width: Option<Pixels>,
+        line_clamp: Option<usize>,
+        inline_boxes: &[LineInlineBox],
+    ) -> Result<SmallVec<[WrappedLine; 1]>> {
         let mut runs = runs.iter().filter(|run| run.len > 0).cloned().peekable();
         let mut font_runs = self.font_runs_buffer.take();
 
@@ -792,13 +808,31 @@ impl WindowTextSystem {
                 run_start += run_len_within_line;
             }
 
-            let layout = self.line_layout_cache.layout_wrapped_line(
-                &line_text,
-                font_size,
-                &font_runs,
-                wrap_width,
-                max_wrap_lines.map(|max| max.saturating_sub(wrapped_lines)),
-            );
+            let max_lines = max_wrap_lines.map(|max| max.saturating_sub(wrapped_lines));
+            let line_boxes: SmallVec<[LineInlineBox; 0]> = inline_boxes
+                .iter()
+                .filter(|inline_box| {
+                    inline_box.range.start >= line_start && inline_box.range.end <= line_end
+                })
+                .map(|inline_box| LineInlineBox {
+                    range: inline_box.range.start - line_start..inline_box.range.end - line_start,
+                    ..inline_box.clone()
+                })
+                .collect();
+            let layout = if line_boxes.is_empty() {
+                self.line_layout_cache
+                    .layout_wrapped_line(&line_text, font_size, &font_runs, wrap_width, max_lines)
+            } else {
+                self.line_layout_cache
+                    .layout_wrapped_line_with_inline_boxes(
+                        &line_text,
+                        font_size,
+                        &font_runs,
+                        wrap_width,
+                        max_lines,
+                        &line_boxes,
+                    )
+            };
             wrapped_lines += layout.wrap_boundaries.len();
 
             lines.push(WrappedLine {

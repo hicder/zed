@@ -11110,7 +11110,7 @@ fn language_settings_data() -> Box<[SettingsPageItem]> {
         ]
     }
 
-    fn global_only_miscellaneous_sub_section() -> [SettingsPageItem; 4] {
+    fn global_only_miscellaneous_sub_section() -> [SettingsPageItem; 5] {
         [
             SettingsPageItem::SettingItem(SettingItem {
                 title: "Image Viewer",
@@ -11149,6 +11149,29 @@ fn language_settings_data() -> Box<[SettingsPageItem]> {
                             .markdown_preview
                             .get_or_insert_default()
                             .open_markdown_files_in_preview = value;
+                    },
+                }),
+                metadata: None,
+                files: USER,
+            }),
+            SettingsPageItem::SettingItem(SettingItem {
+                title: "Render Math in Markdown Preview",
+                description: "Whether to render LaTeX math, between dollar sign delimiters or in math code blocks.",
+                field: Box::new(SettingField {
+                    organization_override: None,
+                    json_path: Some("markdown_preview.render_math"),
+                    pick: |settings_content| {
+                        settings_content
+                            .markdown_preview
+                            .as_ref()?
+                            .render_math
+                            .as_ref()
+                    },
+                    write: |settings_content, value, _| {
+                        settings_content
+                            .markdown_preview
+                            .get_or_insert_default()
+                            .render_math = value;
                     },
                 }),
                 metadata: None,

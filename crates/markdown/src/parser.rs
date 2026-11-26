@@ -153,6 +153,12 @@ fn build_heading_slugs(
                 }
                 heading_text.push_str(&source[range.clone()]);
             }
+            MarkdownEvent::InlineMath(tex) | MarkdownEvent::DisplayMath(tex) if inside_heading => {
+                if heading_source_start.is_none() {
+                    heading_source_start = Some(range.start);
+                }
+                heading_text.push_str(tex);
+            }
             MarkdownEvent::SubstitutedCode(substituted) if inside_heading => {
                 if heading_source_start.is_none() {
                     heading_source_start = Some(range.start);
@@ -273,11 +279,30 @@ fn yaml_frontmatter_candidate(text: &str) -> Option<&str> {
     None
 }
 
+#[cfg(test)]
 pub(crate) fn parse_markdown_with_options(
     text: &str,
     parse_html: bool,
     parse_heading_slugs: bool,
     parse_metadata_blocks: bool,
+) -> ParsedMarkdownData {
+    parse_markdown_with_math(
+        text,
+        parse_html,
+        parse_heading_slugs,
+        parse_metadata_blocks,
+        false,
+    )
+}
+
+/// Parses markdown, optionally recognizing `$...$` and `$$...$$` as math. This is opt-in
+/// because dollar signs are common in text that isn't math.
+pub(crate) fn parse_markdown_with_math(
+    text: &str,
+    parse_html: bool,
+    parse_heading_slugs: bool,
+    parse_metadata_blocks: bool,
+    parse_math: bool,
 ) -> ParsedMarkdownData {
     let mut state = ParseState::default();
     let mut language_names = HashSet::default();
@@ -311,7 +336,12 @@ pub(crate) fn parse_markdown_with_options(
         }
     }
     let body_start = frontmatter.last().map_or(0, |(_, range)| range.end);
-    let parser = Parser::new_ext(&text[body_start..], PARSE_OPTIONS);
+    let body_options = if parse_math {
+        PARSE_OPTIONS.union(Options::ENABLE_MATH)
+    } else {
+        PARSE_OPTIONS
+    };
+    let parser = Parser::new_ext(&text[body_start..], body_options);
     let mut link_definition_spans = parser
         .reference_definitions()
         .iter()
@@ -728,7 +758,22 @@ pub(crate) fn parse_markdown_with_options(
             pulldown_cmark::Event::TaskListMarker(checked) => {
                 state.push_event(range, MarkdownEvent::TaskListMarker(checked))
             }
-            pulldown_cmark::Event::InlineMath(_) | pulldown_cmark::Event::DisplayMath(_) => {}
+            pulldown_cmark::Event::InlineMath(tex) => {
+                // As in Pandoc, a closing `$` followed by a digit is taken to be a price,
+                // as in "$5-$10".
+                let closes_before_digit =
+                    text[range.end..].starts_with(|character: char| character.is_ascii_digit());
+                let event = if closes_before_digit {
+                    MarkdownEvent::Text
+                } else {
+                    MarkdownEvent::InlineMath(SharedString::from(tex.into_string()))
+                };
+                state.push_event(range, event)
+            }
+            pulldown_cmark::Event::DisplayMath(tex) => state.push_event(
+                range,
+                MarkdownEvent::DisplayMath(SharedString::from(tex.into_string())),
+            ),
         }
     }
 
@@ -835,6 +880,12 @@ pub enum MarkdownEvent {
     Code,
     /// An inline code node that differs from the markdown source due to escape decoding.
     SubstitutedCode(String),
+    /// Math within a line of text, like `$x^2$`. Holds the TeX source, which can differ
+    /// from the event's range, as the range includes the delimiters.
+    InlineMath(SharedString),
+    /// Math set apart from the text around it, like `$$x^2$$`, with a range and TeX
+    /// source as in [`Self::InlineMath`].
+    DisplayMath(SharedString),
     /// An HTML node.
     Html,
     /// An inline HTML node.
@@ -1041,10 +1092,10 @@ mod tests {
     use super::MarkdownTag::*;
     use super::*;
 
-    const CONDITIONAL_OPTIONS: Options = Options::ENABLE_YAML_STYLE_METADATA_BLOCKS;
-    const UNWANTED_OPTIONS: Options = Options::ENABLE_MATH
-        .union(Options::ENABLE_DEFINITION_LIST)
-        .union(Options::ENABLE_WIKILINKS);
+    const CONDITIONAL_OPTIONS: Options =
+        Options::ENABLE_YAML_STYLE_METADATA_BLOCKS.union(Options::ENABLE_MATH);
+    const UNWANTED_OPTIONS: Options =
+        Options::ENABLE_DEFINITION_LIST.union(Options::ENABLE_WIKILINKS);
 
     #[test]
     fn all_options_considered() {
@@ -1066,6 +1117,66 @@ mod tests {
                 .intersection(UNWANTED_OPTIONS),
             Options::empty()
         );
+    }
+
+    fn math_events(source: &str) -> Vec<(Range<usize>, MarkdownEvent)> {
+        parse_markdown_with_math(source, false, false, false, true)
+            .events
+            .into_iter()
+            .filter(|(_, event)| matches!(event, InlineMath(_) | DisplayMath(_)))
+            .collect()
+    }
+
+    #[test]
+    fn test_math() {
+        assert_eq!(
+            math_events("a $x_1 *b* y_2$ c"),
+            vec![(2..15, InlineMath("x_1 *b* y_2".into()))]
+        );
+        assert_eq!(
+            math_events("$$x$$ and $$\ny$$"),
+            vec![
+                (0..5, DisplayMath("x".into())),
+                (10..16, DisplayMath("\ny".into()))
+            ]
+        );
+        // Block quote markers and table escapes aren't part of the TeX source.
+        assert_eq!(
+            math_events("> $$\n> a\n> $$"),
+            vec![(2..13, DisplayMath("\na\n".into()))]
+        );
+        assert_eq!(
+            math_events("| a |\n|---|\n| $\\|x\\|$ |"),
+            vec![(14..21, InlineMath("|x|".into()))]
+        );
+    }
+
+    #[test]
+    fn test_dollar_signs_that_are_not_math() {
+        for source in [
+            "costs $5 and $10 today",
+            "between $5-$10",
+            "$5, $6",
+            "a $ x $ b",
+            r"\$x\$",
+            "`$x$`",
+            "```\n$x$\n```",
+            "    $$x$$",
+        ] {
+            assert_eq!(math_events(source), vec![], "{source:?}");
+        }
+    }
+
+    #[test]
+    fn test_math_is_only_parsed_when_enabled() {
+        let source = "a $x$ and $$y$$";
+        let events = parse_markdown_with_options(source, false, false, false).events;
+        assert!(
+            events
+                .iter()
+                .all(|(_, event)| !matches!(event, InlineMath(_) | DisplayMath(_)))
+        );
+        assert!(events.contains(&(0..source.len(), RootEnd(0))));
     }
 
     #[test]

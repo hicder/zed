@@ -191,6 +191,73 @@ impl LineLayout {
         (left, right)
     }
 
+    /// Returns a copy of this layout in which the glyphs of each box are collapsed into a
+    /// single placeholder glyph that is as wide as the box, so that wrapping, hit testing,
+    /// and painting treat the box as one unit. `boxes` must be sorted and disjoint.
+    ///
+    /// Boxes whose text shaped to no glyphs are left out of the returned placements.
+    fn with_inline_boxes(
+        &self,
+        boxes: &[LineInlineBox],
+        max_width: Option<Pixels>,
+    ) -> (LineLayout, Vec<PlacedInlineBox>) {
+        let mut placed_boxes: Vec<PlacedInlineBox> = Vec::with_capacity(boxes.len());
+        let mut runs = Vec::with_capacity(self.runs.len());
+        let mut shift = px(0.);
+        // The box whose glyphs are being collapsed, with its unshifted start position.
+        let mut open_box: Option<(PlacedInlineBox, Pixels)> = None;
+
+        for run in &self.runs {
+            let mut glyphs = Vec::with_capacity(run.glyphs.len());
+            for glyph in &run.glyphs {
+                let containing_box = boxes
+                    .get(boxes.partition_point(|candidate| candidate.range.end <= glyph.index))
+                    .filter(|candidate| candidate.range.start <= glyph.index);
+
+                if let Some((placed, start_x)) = &open_box {
+                    if containing_box.is_some_and(|candidate| candidate.range.start == placed.index)
+                    {
+                        continue;
+                    }
+                    shift += placed.width - (glyph.position.x - *start_x);
+                    placed_boxes.push(*placed);
+                    open_box = None;
+                }
+
+                let mut glyph = glyph.clone();
+                if let Some(inline_box) = containing_box {
+                    open_box = Some((inline_box.place(max_width), glyph.position.x));
+                    glyph.index = inline_box.range.start;
+                    glyph.position.y = px(0.);
+                    glyph.is_emoji = false;
+                }
+                glyph.position.x += shift;
+                glyphs.push(glyph);
+            }
+            if !glyphs.is_empty() {
+                runs.push(ShapedRun {
+                    font_id: run.font_id,
+                    glyphs,
+                });
+            }
+        }
+
+        if let Some((placed, start_x)) = open_box {
+            shift += placed.width - (self.width - start_x);
+            placed_boxes.push(placed);
+        }
+
+        let layout = LineLayout {
+            font_size: self.font_size,
+            width: self.width + shift,
+            ascent: self.ascent,
+            descent: self.descent,
+            runs,
+            len: self.len,
+        };
+        (layout, placed_boxes)
+    }
+
     fn compute_wrap_boundaries(
         &self,
         text: &str,
@@ -292,6 +359,58 @@ impl LineLayout {
     }
 }
 
+/// An [`InlineBox`](crate::InlineBox) to reserve within a single line of text.
+#[derive(Clone, Debug)]
+pub(crate) struct LineInlineBox {
+    /// The position of this box among all the boxes of the shaped text.
+    pub box_index: usize,
+    /// The byte range, relative to the start of the line, that the box replaces.
+    pub range: Range<usize>,
+    pub width: Pixels,
+    pub ascent: Pixels,
+    pub descent: Pixels,
+}
+
+impl LineInlineBox {
+    fn place(&self, max_width: Option<Pixels>) -> PlacedInlineBox {
+        // A box can't wrap, so one that is wider than the line shrinks to fit it.
+        let scale = match max_width {
+            Some(max_width) if max_width > px(0.) && self.width > max_width => {
+                max_width / self.width
+            }
+            _ => 1.,
+        };
+        PlacedInlineBox {
+            box_index: self.box_index,
+            index: self.range.start,
+            width: self.width * scale,
+            ascent: self.ascent * scale,
+            descent: self.descent * scale,
+        }
+    }
+}
+
+/// An inline box that has been given its place in a [`WrappedLineLayout`].
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct PlacedInlineBox {
+    pub box_index: usize,
+    /// The byte index, within the line, of the placeholder glyph standing in for the box.
+    pub index: usize,
+    pub width: Pixels,
+    pub ascent: Pixels,
+    pub descent: Pixels,
+}
+
+impl PlacedInlineBox {
+    /// The smallest line height that keeps this box within its row, given that text is
+    /// centered vertically in a row by its own ascent and descent.
+    pub fn min_line_height(&self, line_ascent: Pixels, line_descent: Pixels) -> Pixels {
+        let above_baseline = self.ascent * 2. - line_ascent + line_descent;
+        let below_baseline = self.descent * 2. + line_ascent - line_descent;
+        above_baseline.max(below_baseline)
+    }
+}
+
 /// A line of text that has been wrapped to fit a given width
 #[derive(Default, Debug)]
 pub struct WrappedLineLayout {
@@ -303,6 +422,8 @@ pub struct WrappedLineLayout {
 
     /// The width of the line, if it was wrapped
     pub wrap_width: Option<Pixels>,
+
+    pub(crate) inline_boxes: Vec<PlacedInlineBox>,
 }
 
 /// A boundary at which a line was wrapped
@@ -671,6 +792,7 @@ impl LineLayoutCache {
                 unwrapped_layout,
                 wrap_boundaries,
                 wrap_width,
+                inline_boxes: Vec::new(),
             });
             let key = Arc::new(CacheKey {
                 text,
@@ -690,6 +812,47 @@ impl LineLayoutCache {
 
             layout
         }
+    }
+
+    /// Like [`Self::layout_wrapped_line`], but reserving space for `boxes`. Only the
+    /// unwrapped text is cached, as placing the boxes is cheap compared to shaping.
+    pub(crate) fn layout_wrapped_line_with_inline_boxes(
+        &self,
+        text: &SharedString,
+        font_size: Pixels,
+        runs: &[FontRun],
+        wrap_width: Option<Pixels>,
+        max_lines: Option<usize>,
+        boxes: &[LineInlineBox],
+    ) -> Arc<WrappedLineLayout> {
+        let shaped = self.layout_line::<&SharedString>(text, font_size, runs, None);
+        let (layout, inline_boxes) = shaped.with_inline_boxes(boxes, wrap_width);
+        let wrap_boundaries = if let Some(wrap_width) = wrap_width {
+            // Line break opportunities must depend on the text around a box, not on the
+            // text it replaces, so every box is treated as a word.
+            let mut break_text = String::with_capacity(text.len());
+            let mut copied_up_to = 0;
+            for inline_box in boxes {
+                break_text.push_str(&text[copied_up_to..inline_box.range.start]);
+                break_text.extend(std::iter::repeat_n('a', inline_box.range.len()));
+                copied_up_to = inline_box.range.end;
+            }
+            break_text.push_str(&text[copied_up_to..]);
+            layout.compute_wrap_boundaries(
+                &break_text,
+                wrap_width,
+                max_lines,
+                &mut self.wrap_scratch.borrow_mut(),
+            )
+        } else {
+            SmallVec::new()
+        };
+        Arc::new(WrappedLineLayout {
+            unwrapped_layout: Arc::new(layout),
+            wrap_boundaries,
+            wrap_width,
+            inline_boxes,
+        })
     }
 
     pub fn layout_line<Text>(
